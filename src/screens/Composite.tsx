@@ -106,7 +106,8 @@ export function Composite({ caps, onDone, onCancel }: Props) {
 
       {phase === 'overview' && (
         <section className="card">
-          <h2>Sequence ({queue.length} methods)</h2>
+          <p className="cta-kicker">Sequence</p>
+          <h2>{queue.length} methods</h2>
           <ol className="setup-steps">
             {queue.map((m) => (
               <li key={m.id}>
@@ -181,7 +182,7 @@ export function Composite({ caps, onDone, onCancel }: Props) {
                   <div className="live-bpm-chip">~{Math.round(live.bpmLive)} BPM</div>
                 )}
               </div>
-              <SignalWaveform samples={live?.waveform ?? []} height={64} />
+              <SignalWaveform samples={live?.waveform ?? []} height={72} />
               <QualityMeter quality={live?.quality ?? 0} />
             </>
           )}
@@ -189,7 +190,8 @@ export function Composite({ caps, onDone, onCancel }: Props) {
       )}
 
       {phase === 'summary' && fused && (
-        <section className="card">
+        <section className="card card--highlight">
+          <p className="cta-kicker">Fusion</p>
           <h2>Composite result</h2>
           <BpmDisplay
             bpm={fused.bpm}

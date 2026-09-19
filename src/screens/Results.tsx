@@ -26,7 +26,8 @@ export function Results({ latest, history, onBack, onHistoryChange }: Props) {
 
       {latest && (
         <section className="card card--highlight">
-          <h2>Latest</h2>
+          <p className="cta-kicker">Latest</p>
+          <h2>Your reading</h2>
           <BpmDisplay
             bpm={latest.bpm}
             confidence={latest.confidence}
@@ -43,9 +44,10 @@ export function Results({ latest, history, onBack, onHistoryChange }: Props) {
         </section>
       )}
 
-      <section className="card">
+      <p className="section-label">History</p>
+      <section className="card" style={{ marginTop: '0.35rem' }}>
         <div className="card__row">
-          <h2>History</h2>
+          <h2 style={{ fontSize: '1.15rem' }}>Past readings</h2>
           {history.length > 0 && (
             <button
               type="button"

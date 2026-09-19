@@ -68,6 +68,7 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
 
       {phase === 'setup' && (
         <section className="card">
+          <p className="cta-kicker">Setup</p>
           <h2>{meta.setupTitle}</h2>
           <ol className="setup-steps">
             {meta.setupSteps.map((s) => (
@@ -117,7 +118,7 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
             )}
           </div>
 
-          <SignalWaveform samples={live?.waveform ?? []} height={64} />
+          <SignalWaveform samples={live?.waveform ?? []} height={72} />
           <QualityMeter quality={live?.quality ?? 0} />
 
           <button type="button" className="btn btn--ghost btn--block" onClick={cancel}>
@@ -127,7 +128,8 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
       )}
 
       {phase === 'done' && result && (
-        <section className="card">
+        <section className="card card--highlight">
+          <p className="cta-kicker">Complete</p>
           <h2>Reading</h2>
           <BpmDisplay
             bpm={result.bpm}

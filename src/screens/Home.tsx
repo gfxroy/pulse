@@ -28,6 +28,7 @@ export function Home({ caps, onQuick, onComposite, onHistory, historyCount }: Pr
       <Disclaimer compact />
 
       <section className="card card--highlight">
+        <p className="cta-kicker">Recommended</p>
         <h2>Quick check</h2>
         <p className="muted">
           Single best available method
@@ -44,7 +45,8 @@ export function Home({ caps, onQuick, onComposite, onHistory, historyCount }: Pr
       </section>
 
       <section className="card">
-        <h2>Guided multi-method scan</h2>
+        <p className="cta-kicker">Multi-sensor</p>
+        <h2>Guided scan</h2>
         <p className="muted">
           Run each available method in sequence, then fuse with confidence weighting.
           {canComposite
@@ -61,8 +63,8 @@ export function Home({ caps, onQuick, onComposite, onHistory, historyCount }: Pr
         </button>
       </section>
 
-      <section className="card">
-        <h2>Available methods</h2>
+      <p className="section-label">Available methods</p>
+      <section className="card" style={{ marginTop: '0.35rem' }}>
         <div className="method-list">
           {methods.length === 0 && (
             <p className="warn-text">
