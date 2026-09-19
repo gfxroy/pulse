@@ -3,6 +3,7 @@ import { Disclaimer } from '../components/Disclaimer';
 import { SignalWaveform } from '../components/SignalWaveform';
 import { QualityMeter } from '../components/QualityMeter';
 import { BpmDisplay } from '../components/BpmDisplay';
+import { CameraGuide } from '../components/CameraGuide';
 import { availableMethods, METHOD_META, runMethod } from '../methods';
 import { fuseResults, methodLabel } from '../fusion/fuse';
 import type {
@@ -21,6 +22,8 @@ interface Props {
 
 type Phase = 'overview' | 'setup' | 'running' | 'summary';
 
+const CAMERA_METHODS: MethodId[] = ['fingertip_ppg', 'facial_rppg'];
+
 export function Composite({ caps, onDone, onCancel }: Props) {
   const queue = availableMethods(caps);
   const [phase, setPhase] = useState<Phase>('overview');
@@ -32,6 +35,7 @@ export function Composite({ caps, onDone, onCancel }: Props) {
   const abortRef = useRef<AbortController | null>(null);
 
   const current = queue[index];
+  const isCamera = current ? CAMERA_METHODS.includes(current.id) : false;
 
   useEffect(() => {
     return () => abortRef.current?.abort();
@@ -122,7 +126,7 @@ export function Composite({ caps, onDone, onCancel }: Props) {
       )}
 
       {(phase === 'setup' || phase === 'running') && current && (
-        <section className="card">
+        <section className={`card${phase === 'running' && isCamera ? ' card--camera' : ''}`}>
           <div className="step-indicator">
             Method {index + 1} of {queue.length}
           </div>
@@ -140,7 +144,7 @@ export function Composite({ caps, onDone, onCancel }: Props) {
                 <p>{current.goodSignalLooksLike}</p>
               </div>
               {current.id === 'fingertip_ppg' && (
-                <p className="warn-text">
+                <p className="hint-text">
                   Turn flashlight on manually. Torch API is never used.
                 </p>
               )}
@@ -158,16 +162,27 @@ export function Composite({ caps, onDone, onCancel }: Props) {
 
           {phase === 'running' && (
             <>
-              <p className="live-status">{live?.status ?? 'Starting…'}</p>
-              <div className="progress-ring">
-                <span>
+              {live?.camera && (
+                <CameraGuide
+                  guide={live.camera}
+                  status={live.status}
+                  showFlashHint={current.id === 'fingertip_ppg'}
+                />
+              )}
+              {!live?.camera && (
+                <p className="live-status">{live?.status ?? 'Starting…'}</p>
+              )}
+              <div className="live-meta">
+                <div className="progress-chip">
                   {live ? Math.min(current.durationSec, Math.ceil(live.elapsedSec)) : 0}
-                  <small> / {current.durationSec}s</small>
-                </span>
+                  <span>/{current.durationSec}s</span>
+                </div>
+                {live?.bpmLive != null && (
+                  <div className="live-bpm-chip">~{Math.round(live.bpmLive)} BPM</div>
+                )}
               </div>
-              <SignalWaveform samples={live?.waveform ?? []} />
+              <SignalWaveform samples={live?.waveform ?? []} height={64} />
               <QualityMeter quality={live?.quality ?? 0} />
-              <Disclaimer compact />
             </>
           )}
         </section>

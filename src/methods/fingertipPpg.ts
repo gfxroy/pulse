@@ -5,12 +5,20 @@
 
 import { BandpassFilter, normalize } from '../dsp/filters';
 import { estimateHeartRate } from '../dsp/hrEstimate';
-import type { MethodResult } from '../types';
+import type { CameraCueLevel, MethodResult } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
 
 const TARGET_FPS = 30;
 const DURATION = METHOD_META.fingertip_ppg.durationSec;
+
+function recentVariance(arr: number[]): number {
+  if (arr.length < 2) return 0;
+  const mean = arr.reduce((a, c) => a + c, 0) / arr.length;
+  let v = 0;
+  for (const x of arr) v += (x - mean) ** 2;
+  return v / arr.length;
+}
 
 export async function runFingertipPpg(
   onLive: LiveCallback,
@@ -24,9 +32,9 @@ export async function runFingertipPpg(
   let settled = false;
 
   const samples: number[] = [];
-  const times: number[] = [];
   const filter = new BandpassFilter(0.7, 4.0, TARGET_FPS, true);
   const waveformWindow: number[] = [];
+  const recentMeanR: number[] = [];
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -64,7 +72,7 @@ export async function runFingertipPpg(
         const vw = video!.videoWidth;
         const vh = video!.videoHeight;
         if (vw > 0 && vh > 0) {
-          // Center crop ~40% for fingertip region
+          // Center crop ~40% for fingertip region (matches on-screen target)
           const cw = Math.floor(vw * 0.4);
           const ch = Math.floor(vh * 0.4);
           const sx = Math.floor((vw - cw) / 2);
@@ -86,23 +94,45 @@ export async function runFingertipPpg(
           const meanR = sumR / pixels;
           const meanG = sumG / pixels;
           const meanB = sumB / pixels;
+          const meanLuma = (meanR + meanG + meanB) / 3;
 
-          // Coverage heuristic: high red, moderately high overall (flashlight through finger)
           const redDominance = meanR / (meanG + meanB + 1);
           const coverageOk = meanR > 80 && redDominance > 1.1;
 
+          recentMeanR.push(meanR);
+          if (recentMeanR.length > TARGET_FPS) recentMeanR.shift();
+          const motionVar = recentVariance(recentMeanR);
+
           const filtered = filter.process(meanR);
           samples.push(filtered);
-          times.push(elapsed);
 
           waveformWindow.push(filtered);
           if (waveformWindow.length > 90) waveformWindow.shift();
 
           let quality = 0.15;
           let bpmLive: number | null = null;
-          let status = coverageOk
-            ? 'Collecting pulse signal…'
-            : 'Place fingertip over camera + flash (flashlight ON)';
+          let cueLevel: CameraCueLevel = 'bad';
+          let status = 'Cover the lens completely';
+
+          // Real metric-driven cues (not timers)
+          if (meanLuma < 25 && meanR < 40) {
+            status = 'Too dark / turn flashlight on';
+            cueLevel = 'bad';
+          } else if (!coverageOk) {
+            if (meanR < 60 || redDominance < 0.95) {
+              status = 'Cover the lens completely';
+            } else {
+              status = 'Press gently — need more red glow';
+            }
+            cueLevel = 'bad';
+          } else if (motionVar > 900 && samples.length > TARGET_FPS) {
+            // Large frame-to-frame red swings → motion / incomplete cover
+            status = 'Hold still';
+            cueLevel = 'warn';
+          } else {
+            status = 'Hold still';
+            cueLevel = 'warn';
+          }
 
           if (samples.length > TARGET_FPS * 4) {
             const slice = samples.slice(-Math.min(samples.length, TARGET_FPS * 12));
@@ -113,9 +143,13 @@ export async function runFingertipPpg(
             });
             quality = coverageOk ? est.quality : est.quality * 0.4;
             bpmLive = est.bpm;
-            if (coverageOk && est.bpm) {
-              status = `Live ~${Math.round(est.bpm)} BPM`;
+            if (coverageOk && est.quality >= 0.45 && est.bpm) {
+              status = 'Good signal';
+              cueLevel = 'good';
               settled = true;
+            } else if (coverageOk && motionVar <= 900) {
+              status = 'Hold still';
+              cueLevel = 'warn';
             }
           }
 
@@ -125,6 +159,14 @@ export async function runFingertipPpg(
             bpmLive,
             elapsedSec: elapsed,
             status,
+            camera: {
+              mode: 'fingertip',
+              stream: stream!,
+              mirror: false,
+              cueLevel,
+              meanRed: meanR,
+              redDominance,
+            },
           });
         }
 

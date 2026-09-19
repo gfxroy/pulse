@@ -5,7 +5,7 @@
 
 import { BandpassFilter, normalize, detrend } from '../dsp/filters';
 import { estimateHeartRate } from '../dsp/hrEstimate';
-import type { MethodResult } from '../types';
+import type { CameraCueLevel, MethodResult, NormRect } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
 
@@ -25,6 +25,23 @@ declare class FaceDetector {
   detect(image: ImageBitmapSource): Promise<Array<{ boundingBox: DOMRectReadOnly }>>;
 }
 
+function recentVariance(arr: number[]): number {
+  if (arr.length < 2) return 0;
+  const mean = arr.reduce((a, c) => a + c, 0) / arr.length;
+  let v = 0;
+  for (const x of arr) v += (x - mean) ** 2;
+  return v / arr.length;
+}
+
+function toNorm(roi: Roi, vw: number, vh: number): NormRect {
+  return {
+    x: roi.x / vw,
+    y: roi.y / vh,
+    w: roi.w / vw,
+    h: roi.h / vh,
+  };
+}
+
 export async function runFacialRppg(
   onLive: LiveCallback,
   signal: AbortSignal,
@@ -41,6 +58,7 @@ export async function runFacialRppg(
   const posSignal: number[] = [];
   const filter = new BandpassFilter(0.7, 3.5, TARGET_FPS, true);
   const waveformWindow: number[] = [];
+  const recentPos: number[] = [];
 
   let detector: FaceDetector | null = null;
   if (typeof FaceDetector !== 'undefined') {
@@ -77,6 +95,8 @@ export async function runFacialRppg(
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
     let frameCount = 0;
     let lastRoi: Roi | null = null;
+    let lastFaceBox: Roi | null = null;
+    let faceMissStreak = 0;
 
     await new Promise<void>((resolve, reject) => {
       const tick = async () => {
@@ -104,6 +124,12 @@ export async function runFacialRppg(
               const faces = await detector.detect(canvas!);
               if (faces.length > 0) {
                 const b = faces[0].boundingBox;
+                lastFaceBox = {
+                  x: b.x,
+                  y: b.y,
+                  w: b.width,
+                  h: b.height,
+                };
                 // Forehead + upper cheeks: top 55% of face, inset horizontally
                 lastRoi = {
                   x: Math.floor(b.x + b.width * 0.15),
@@ -111,20 +137,28 @@ export async function runFacialRppg(
                   w: Math.floor(b.width * 0.7),
                   h: Math.floor(b.height * 0.45),
                 };
+                faceMissStreak = 0;
+              } else {
+                faceMissStreak++;
+                if (faceMissStreak > 3) {
+                  lastRoi = null;
+                  lastFaceBox = null;
+                }
               }
             } catch {
               /* ignore detect errors */
             }
           }
 
-          const roi: Roi =
-            lastRoi ??
-            ({
-              x: Math.floor(vw * 0.3),
-              y: Math.floor(vh * 0.15),
-              w: Math.floor(vw * 0.4),
-              h: Math.floor(vh * 0.35),
-            } satisfies Roi);
+          const guideRoi: Roi = {
+            x: Math.floor(vw * 0.28),
+            y: Math.floor(vh * 0.12),
+            w: Math.floor(vw * 0.44),
+            h: Math.floor(vh * 0.42),
+          };
+
+          const roi: Roi = lastRoi ?? guideRoi;
+          const faceDetected = lastRoi != null;
 
           const img = ctx.getImageData(
             Math.max(0, roi.x),
@@ -136,7 +170,7 @@ export async function runFacialRppg(
           let sG = 0;
           let sB = 0;
           const d = img.data;
-          const px = img.width * img.height;
+          const px = img.width * img.height || 1;
           for (let i = 0; i < d.length; i += 4) {
             sR += d[i];
             sG += d[i + 1];
@@ -196,11 +230,30 @@ export async function runFacialRppg(
           waveformWindow.push(filtered);
           if (waveformWindow.length > 90) waveformWindow.shift();
 
+          recentPos.push(filtered);
+          if (recentPos.length > TARGET_FPS) recentPos.shift();
+          const motionVar = recentVariance(recentPos);
+
+          // Face size: fraction of frame area
+          const faceAreaFrac = lastFaceBox
+            ? (lastFaceBox.w * lastFaceBox.h) / (vw * vh)
+            : 0;
+
           let quality = 0.1;
           let bpmLive: number | null = null;
-          let status = lastRoi
-            ? 'Face locked — keep still…'
-            : 'Center your face in the frame…';
+          let cueLevel: CameraCueLevel = 'bad';
+          let status = 'Center your face in the frame';
+
+          if (detector && !faceDetected) {
+            status = 'Center your face in the frame';
+            cueLevel = 'bad';
+          } else if (faceDetected && faceAreaFrac > 0 && faceAreaFrac < 0.06) {
+            status = 'Move closer';
+            cueLevel = 'warn';
+          } else if (faceDetected || !detector) {
+            status = 'Hold still';
+            cueLevel = 'warn';
+          }
 
           if (posSignal.length > TARGET_FPS * 6) {
             const slice = posSignal.slice(-Math.min(posSignal.length, TARGET_FPS * 20));
@@ -209,10 +262,32 @@ export async function runFacialRppg(
               fMin: 0.75,
               fMax: 3.0,
             });
-            quality = est.quality * (lastRoi ? 1 : 0.7);
+            quality = est.quality * (faceDetected || !detector ? 1 : 0.7);
             bpmLive = est.bpm;
-            if (est.bpm) status = `Live ~${Math.round(est.bpm)} BPM`;
+
+            if ((faceDetected || !detector) && faceAreaFrac >= 0.06) {
+              if (est.quality >= 0.4 && est.bpm && motionVar < 0.08) {
+                status = 'Good pulse signal';
+                cueLevel = 'good';
+              } else if (motionVar >= 0.08) {
+                status = 'Hold still';
+                cueLevel = 'warn';
+              } else if (est.bpm) {
+                status = 'Hold still';
+                cueLevel = 'warn';
+              }
+            }
           }
+
+          // Mirror: FaceDetector boxes are in unmirrored video space.
+          // Preview is CSS-mirrored, so flip ROI horizontally for overlay alignment.
+          const normRoi = toNorm(roi, vw, vh);
+          const displayRoi: NormRect = {
+            x: 1 - normRoi.x - normRoi.w,
+            y: normRoi.y,
+            w: normRoi.w,
+            h: normRoi.h,
+          };
 
           onLive({
             waveform: [...waveformWindow],
@@ -220,6 +295,15 @@ export async function runFacialRppg(
             bpmLive,
             elapsedSec: elapsed,
             status,
+            camera: {
+              mode: 'face',
+              stream: stream!,
+              mirror: true,
+              cueLevel,
+              faceDetected: faceDetected || !detector,
+              roi: displayRoi,
+              roiLocked: faceDetected,
+            },
           });
         }
 

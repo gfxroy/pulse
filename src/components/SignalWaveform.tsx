@@ -32,16 +32,16 @@ export function SignalWaveform({ samples, height = 88 }: Props) {
       preserveAspectRatio="none"
       aria-hidden
     >
-      <defs>
-        <linearGradient id="waveGrad" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stopColor="#3dba9a" stopOpacity="0.35" />
-          <stop offset="50%" stopColor="#7ee0c3" stopOpacity="1" />
-          <stop offset="100%" stopColor="#3dba9a" stopOpacity="0.35" />
-        </linearGradient>
-      </defs>
       <line x1="0" y1={height / 2} x2="300" y2={height / 2} className="waveform-mid" />
       {path ? (
-        <path d={path} fill="none" stroke="url(#waveGrad)" strokeWidth="2.2" strokeLinecap="round" />
+        <path
+          d={path}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.75"
+          strokeLinecap="square"
+          className="waveform-path"
+        />
       ) : (
         <text x="150" y={height / 2 + 4} textAnchor="middle" className="waveform-empty">
           Waiting for signal…

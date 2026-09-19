@@ -23,7 +23,7 @@ export function Onboarding({ caps, probing, onComplete }: Props) {
   return (
     <div className="screen screen--onboarding">
       <div className="hero">
-        <div className="hero__pulse" aria-hidden />
+        <span className="hero__mark" aria-hidden />
         <h1>Pulse Wellness</h1>
         <p className="hero__tag">Multi-sensor heart-rate estimate</p>
       </div>
