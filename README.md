@@ -34,13 +34,13 @@ For phone testing, use a tunnel (e.g. Cloudflare Tunnel, ngrok) or deploy to HTT
 
 | Method | Sensor | Notes |
 |--------|--------|-------|
-| Fingertip PPG | Rear camera | Highest confidence. Red-channel mean → bandpass 0.7–4 Hz → peaks + FFT. **Manual flashlight only.** |
-| Chest accel + gyro | DeviceMotion | Lie down, phone on sternum. Accel Z + gyro envelopes cross-validated. |
-| Facial rPPG | Front camera | POS pulse extraction on forehead/cheek ROI (FaceDetector when available). |
-| Mic PCG | Microphone | 20–200 Hz bandpass, Shannon energy, S1/S2 via systole &lt; diastole, HR from S1–S1. |
-| Handheld accel | DeviceMotion | Same family as chest with stronger smoothing; **least precise**. |
+| Fingertip PPG | Rear camera | Highest confidence. Timestamped red-channel → Fs from timestamps → autocorr + Welch/FFT with harmonic rejection. **Manual flashlight only.** |
+| Chest accel + gyro | DeviceMotion | Lie down, phone on sternum. Hilbert/Shannon envelopes; accel↔gyro coincidence; autocorr + harmonic checks. |
+| Facial rPPG | Front camera | POS + CHROM fused by quality; forehead/cheek ROI with skin gating (FaceDetector when available). |
+| Mic PCG | Microphone | 25–150 Hz bandpass, Hilbert/Shannon envelope, noisy-segment reject, S1–S1 with systole/diastole logic. |
+| Handheld accel | DeviceMotion | Longer windows + strict gating (prefer no reading over wrong); **least precise**. |
 
-Capability probe gates each method separately. Guided scan runs available methods in sequence and fuses with quality × reliability weights (finger &gt; chest &gt; face &gt; mic &gt; handheld). Strong disagreements are flagged as outliers and down-weighted.
+Capability probe gates each method separately. Guided scan runs available methods in sequence and fuses with quality × reliability weights (finger &gt; chest &gt; face &gt; mic &gt; handheld). Disagreements &gt;15 BPM from consensus are flagged as outliers and hard-down-weighted (never flat-averaged).
 
 ## iOS motion permission
 
@@ -56,7 +56,7 @@ All processing runs locally in the browser. History is stored in `localStorage` 
 
 ## Stack
 
-Vite + React + TypeScript. Hand-rolled DSP under `src/dsp/` (cascaded Butterworth biquads, FFT, peak detection, Shannon energy, SNR/quality). Method pipelines under `src/methods/`.
+Vite + React + TypeScript. Hand-rolled DSP under `src/dsp/` (cascaded Butterworth, Savitzky–Golay, autocorrelation HR, Welch PSD with harmonic rejection, adaptive peaks, Hilbert/Shannon envelopes, SNR/quality). Method pipelines under `src/methods/`.
 
 ## Disclaimer
 

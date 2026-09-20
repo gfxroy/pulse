@@ -1,14 +1,16 @@
 /**
- * Handheld grip accel — same DSP as chest with stronger noise suppression
- * and longer averaging. Marked least precise in UI.
+ * Handheld grip accel — longer windows, stronger gating.
+ * Prefer “no reading” over wrong reading.
  */
 
-import { BandpassFilter, normalize, movingAverage } from '../dsp/filters';
+import { normalize, filtfiltBandpass, movingAverage } from '../dsp/filters';
 import { beatEnvelope, rmsEnvelope } from '../dsp/envelope';
 import { detectPeaks, bpmFromPeaks } from '../dsp/peaks';
-import { estimateHeartRate } from '../dsp/hrEstimate';
+import { estimateHeartRateSliding, HrTracker } from '../dsp/hrEstimate';
+import { autocorrHeartRate } from '../dsp/autocorr';
 import { combineQuality, timeDomainSnrDb, regularityScore, bpmAgreement } from '../dsp/quality';
-import { spectralPeak, spectralSnrDb } from '../dsp/fft';
+import { spectralPeakHarmonicAware } from '../dsp/welch';
+import { savitzkyGolay, linearDetrend } from '../dsp/preprocess';
 import type { MethodResult } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
@@ -22,13 +24,13 @@ export async function runHandheldAccel(
 ): Promise<MethodResult> {
   const started = Date.now();
   const samples: { t: number; v: number }[] = [];
+  const tracker = new HrTracker(8);
 
   const onMotion = (e: DeviceMotionEvent) => {
     const t = (Date.now() - started) / 1000;
     const ax = e.accelerationIncludingGravity?.x ?? 0;
     const ay = e.accelerationIncludingGravity?.y ?? 0;
     const az = e.accelerationIncludingGravity?.z ?? 0;
-    // Magnitude of high-pass-ish deviation from gravity ~9.8
     const mag = Math.sqrt(ax * ax + ay * ay + az * az);
     samples.push({ t, v: mag });
   };
@@ -36,6 +38,7 @@ export async function runHandheldAccel(
   window.addEventListener('devicemotion', onMotion);
   const waveformWindow: number[] = [];
   let intervalId = 0;
+  let lockedBpm: number | null = null;
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -62,11 +65,18 @@ export async function runHandheldAccel(
         let bpmLive: number | null = null;
         let status = 'Hold very still — least precise method…';
 
-        if (samples.length > FS * 12) {
-          const partial = analyze(samples);
+        // Longer gate before publishing any live reading
+        if (samples.length > FS * 16) {
+          const partial = analyze(samples, lockedBpm);
           quality = partial.quality;
-          bpmLive = partial.bpm;
-          if (bpmLive) status = `Live ~${Math.round(bpmLive)} BPM (low precision)`;
+          if (partial.bpm != null && partial.confidence >= 0.35) {
+            const stable = tracker.push(partial.bpm, 0.35, partial.confidence);
+            bpmLive = stable;
+            if (partial.confidence >= 0.5 && bpmLive != null) lockedBpm = bpmLive;
+            if (bpmLive) status = `Live ~${Math.round(bpmLive)} BPM (low precision)`;
+          } else {
+            status = 'Signal unclear — hold steadier (prefer no reading)';
+          }
         }
 
         onLive({
@@ -84,17 +94,29 @@ export async function runHandheldAccel(
   }
 
   const durationSec = (Date.now() - started) / 1000;
-  const result = analyze(samples);
+  const result = analyze(samples, lockedBpm);
+
+  // Stronger final gate — prefer null over wrong
+  let bpm = result.bpm;
+  let confidence = result.confidence * 0.75;
+  let quality = result.quality * 0.85;
+  if (confidence < 0.32 || result.snrDb < 5) {
+    bpm = null;
+    confidence = 0;
+  }
 
   return {
     methodId: 'handheld_accel',
-    bpm: result.bpm,
-    quality: result.quality * 0.85, // inherent lower trust
-    confidence: result.confidence * 0.8,
+    bpm,
+    quality,
+    confidence,
     durationSec,
     peakCount: result.peakCount,
     snrDb: result.snrDb,
-    notes: 'Least precise method — interpret with caution',
+    notes:
+      bpm == null
+        ? 'No reliable handheld reading — try fingertip or chest'
+        : 'Least precise method — interpret with caution',
     timestamp: Date.now(),
   };
 }
@@ -118,7 +140,10 @@ function resample(series: { t: number; v: number }[], fs: number): Float32Array 
   return out;
 }
 
-function analyze(samples: { t: number; v: number }[]): {
+function analyze(
+  samples: { t: number; v: number }[],
+  lockedBpm: number | null,
+): {
   bpm: number | null;
   quality: number;
   confidence: number;
@@ -126,50 +151,66 @@ function analyze(samples: { t: number; v: number }[]): {
   snrDb: number;
 } {
   const x = resample(samples, FS);
-  if (x.length < FS * 8) {
+  if (x.length < FS * 10) {
     return { bpm: null, quality: 0.05, confidence: 0, peakCount: 0, snrDb: 0 };
   }
 
-  // Stronger noise suppression: narrower band 0.8–8 Hz, heavy smoothing
-  const bp = new BandpassFilter(0.8, 8, FS, true).processBuffer(x);
-  const env = beatEnvelope(bp, FS, 60);
-  const rms = rmsEnvelope(bp, Math.round(FS * 0.08));
+  // Narrower band, heavy envelope smoothing
+  const bp = filtfiltBandpass(x, 0.75, 6, FS);
+  const env = beatEnvelope(bp, FS, 70, true);
+  const rms = rmsEnvelope(bp, Math.round(FS * 0.1));
   const blended = new Float32Array(env.length);
-  for (let i = 0; i < env.length; i++) blended[i] = 0.7 * env[i] + 0.3 * rms[i];
-  const smooth = movingAverage(blended, Math.round(FS * 0.12));
-  const norm = normalize(smooth);
+  for (let i = 0; i < env.length; i++) blended[i] = 0.65 * env[i] + 0.35 * rms[i];
+  const smooth = movingAverage(blended, Math.round(FS * 0.14));
+  const norm = normalize(savitzkyGolay(linearDetrend(smooth), 9));
 
-  // Longer averaging: require more peaks, stricter threshold
   const peaks = detectPeaks(norm, {
     fs: FS,
     minBpm: 45,
-    maxBpm: 160,
-    thresholdRatio: 0.5,
+    maxBpm: 150,
+    thresholdRatio: 0.52,
     adaptWindowSec: 2.5,
+    expectedBpm: lockedBpm,
   });
-  const { bpm: timeBpm } = bpmFromPeaks(peaks, 45, 160);
-  const est = estimateHeartRate(norm, { fs: FS, fMin: 0.75, fMax: 2.7, thresholdRatio: 0.5 });
-  const { peak: spec, magnitudes, freqs } = spectralPeak(norm, FS, 0.75, 2.7, 4);
-  const snrDb = spec ? spectralSnrDb(magnitudes, freqs, spec.bin, 0.75, 2.7) : 0;
+  const { bpm: timeBpm } = bpmFromPeaks(peaks, 45, 150);
 
-  let bpm = est.bpm ?? timeBpm;
-  if (timeBpm != null && est.spectralBpm != null) {
-    if (Math.abs(timeBpm - est.spectralBpm) <= 10) {
-      bpm = 0.4 * timeBpm + 0.6 * est.spectralBpm; // lean spectral for noisy handheld
+  const est = estimateHeartRateSliding(
+    norm,
+    { fs: FS, fMin: 0.75, fMax: 2.5, lockedBpm, useWelch: true, thresholdRatio: 0.5 },
+    12,
+    3,
+  );
+  const ac = autocorrHeartRate(norm, FS, 0.75, 2.5);
+  const harm = spectralPeakHarmonicAware(norm, FS, 0.75, 2.5, true);
+  const snrDb = harm?.snrDb ?? est.snrDb;
+
+  // Require agreement between at least two estimators
+  const vals = [timeBpm, ac.bpm, harm?.bpm ?? null, est.bpm].filter(
+    (v): v is number => v != null,
+  );
+  let bpm: number | null = null;
+  if (vals.length >= 2) {
+    vals.sort((a, b) => a - b);
+    const med = vals[Math.floor(vals.length / 2)];
+    const agree = vals.filter((v) => Math.abs(v - med) <= 10);
+    if (agree.length >= 2) {
+      bpm = agree.reduce((a, b) => a + b, 0) / agree.length;
     }
   }
 
   const quality = combineQuality({
     spectralSnrDb: snrDb,
     timeSnrDb: timeDomainSnrDb(norm, peaks),
-    regularity: regularityScore(peaks, 45, 160),
-    agreement: bpmAgreement(timeBpm, est.spectralBpm, 12),
+    regularity: regularityScore(peaks, 45, 150),
+    agreement: bpmAgreement(timeBpm, ac.bpm, 12),
   });
+
+  const confidence = bpm != null ? quality * 0.8 : 0;
 
   return {
     bpm: bpm != null ? Math.round(bpm * 10) / 10 : null,
     quality,
-    confidence: bpm != null ? quality * 0.85 : 0,
+    confidence,
     peakCount: peaks.length,
     snrDb,
   };

@@ -1,7 +1,7 @@
 /**
  * Confidence-weighted fusion — NOT a flat average.
  * Weights = method quality × reliability prior.
- * Outliers that disagree with consensus are down-weighted / flagged.
+ * Outliers >15 BPM from weighted consensus are down-weighted hard.
  */
 
 import type { CompositeResult, MethodId, MethodResult } from '../types';
@@ -16,12 +16,21 @@ const RELIABILITY: Record<MethodId, number> = {
   handheld_accel: 0.35,
 };
 
+const OUTLIER_BPM = 15;
+
 export function fuseResults(
   methods: MethodResult[],
   mode: 'single' | 'composite' = 'composite',
 ): CompositeResult {
   const timestamp = Date.now();
-  const valid = methods.filter((m) => m.bpm != null && Number.isFinite(m.bpm!) && m.bpm! > 0);
+  const valid = methods.filter(
+    (m) =>
+      m.bpm != null &&
+      Number.isFinite(m.bpm!) &&
+      m.bpm! >= 40 &&
+      m.bpm! <= 200 &&
+      m.confidence > 0.08,
+  );
 
   if (valid.length === 0) {
     return {
@@ -46,7 +55,6 @@ export function fuseResults(
     };
   }
 
-  // Initial weighted estimate
   const weights = valid.map((m) => {
     const q = Math.max(0.05, m.quality);
     const conf = Math.max(0.05, m.confidence);
@@ -57,41 +65,72 @@ export function fuseResults(
   let bpm =
     valid.reduce((acc, m, i) => acc + (m.bpm as number) * weights[i], 0) / wSum;
 
-  // Flag outliers: >12 BPM from consensus
   const outliers: MethodId[] = [];
-  const adjustedWeights = weights.map((w, i) => {
-    const diff = Math.abs((valid[i].bpm as number) - bpm);
-    if (diff > 12) {
-      outliers.push(valid[i].methodId);
-      return w * 0.15; // heavy down-weight
-    }
-    if (diff > 8) return w * 0.5;
-    return w;
-  });
+  let adjustedWeights = [...weights];
+
+  for (let iter = 0; iter < 2; iter++) {
+    wSum = adjustedWeights.reduce((a, b) => a + b, 0) || 1;
+    bpm =
+      valid.reduce((acc, m, i) => acc + (m.bpm as number) * adjustedWeights[i], 0) /
+      wSum;
+
+    adjustedWeights = weights.map((w, i) => {
+      const diff = Math.abs((valid[i].bpm as number) - bpm);
+      if (diff > OUTLIER_BPM) {
+        if (iter === 1 && !outliers.includes(valid[i].methodId)) {
+          outliers.push(valid[i].methodId);
+        }
+        return w * 0.05;
+      }
+      if (diff > 10) return w * 0.35;
+      if (diff > 6) return w * 0.7;
+      return w;
+    });
+  }
 
   wSum = adjustedWeights.reduce((a, b) => a + b, 0) || 1;
   bpm =
     valid.reduce((acc, m, i) => acc + (m.bpm as number) * adjustedWeights[i], 0) / wSum;
 
-  // Confidence: agreement + mean quality + coverage of high-rank methods
-  const spreads = valid.map((m) => Math.abs((m.bpm as number) - bpm));
+  const effective = valid
+    .map((m, i) => ({ m, w: adjustedWeights[i] }))
+    .filter((x) => x.w > wSum * 0.08);
+  if (effective.length === 1) {
+    bpm = effective[0].m.bpm as number;
+  }
+
+  const activeSpreads = valid
+    .map((m, i) => ({
+      diff: Math.abs((m.bpm as number) - bpm),
+      w: adjustedWeights[i],
+    }))
+    .filter((x) => x.w > wSum * 0.05);
   const meanSpread =
-    spreads.reduce((a, b) => a + b, 0) / spreads.length;
+    activeSpreads.length > 0
+      ? activeSpreads.reduce((a, x) => a + x.diff, 0) / activeSpreads.length
+      : 20;
   const agreement = Math.max(0, 1 - meanSpread / 15);
 
   const meanQuality =
-    valid.reduce((a, m) => a + m.quality, 0) / valid.length;
+    valid.reduce((a, m, i) => a + m.quality * adjustedWeights[i], 0) / wSum;
 
-  const hasFinger = valid.some((m) => m.methodId === 'fingertip_ppg');
-  const hasChest = valid.some((m) => m.methodId === 'chest_motion');
+  const hasFinger = valid.some(
+    (m) => m.methodId === 'fingertip_ppg' && !outliers.includes(m.methodId),
+  );
+  const hasChest = valid.some(
+    (m) => m.methodId === 'chest_motion' && !outliers.includes(m.methodId),
+  );
   const coverageBoost = (hasFinger ? 0.08 : 0) + (hasChest ? 0.05 : 0);
 
   let confidence = Math.min(
     1,
-    agreement * 0.45 + meanQuality * 0.4 + coverageBoost + (valid.length >= 3 ? 0.08 : 0.02),
+    agreement * 0.45 +
+      meanQuality * 0.4 +
+      coverageBoost +
+      (effective.length >= 2 ? 0.08 : 0.02),
   );
-  if (outliers.length > 0) confidence *= 0.9;
-  if (outliers.length >= valid.length - 1) confidence *= 0.75;
+  if (outliers.length > 0) confidence *= 0.88;
+  if (outliers.length >= valid.length - 1) confidence *= 0.7;
 
   return {
     bpm: Math.round(bpm * 10) / 10,

@@ -1,14 +1,16 @@
 /**
  * Microphone phonocardiography:
- * bandpass 20–200 Hz → Shannon energy envelope → S1/S2 lobe peaks
- * → systole < diastole heuristic to label S1 vs S2 → HR from S1–S1.
+ * bandpass 25–150 Hz → Hilbert/Shannon envelope → S1/S2 lobes
+ * → systole < diastole → HR from S1–S1; reject noisy segments.
  */
 
-import { BandpassFilter, normalize } from '../dsp/filters';
+import { normalize, filtfiltBandpass } from '../dsp/filters';
 import { beatEnvelope } from '../dsp/envelope';
-import { detectPeaks, type Peak } from '../dsp/peaks';
+import { detectPeaks, type Peak, bpmFromPeaks } from '../dsp/peaks';
 import { combineQuality, timeDomainSnrDb, regularityScore } from '../dsp/quality';
-import { spectralPeak, spectralSnrDb } from '../dsp/fft';
+import { spectralPeakHarmonicAware } from '../dsp/welch';
+import { autocorrHeartRate } from '../dsp/autocorr';
+import { savitzkyGolay } from '../dsp/preprocess';
 import type { MethodResult } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
@@ -44,7 +46,6 @@ export async function runMicPcg(
     audioCtx = new AudioContext();
     sampleRate = audioCtx.sampleRate;
     source = audioCtx.createMediaStreamSource(stream);
-    // ScriptProcessor is deprecated but widely available; Analyser alone isn't enough for raw PCM buffer.
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
     processor.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);
@@ -53,12 +54,8 @@ export async function runMicPcg(
       for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
       liveEnergy = Math.sqrt(sum / input.length);
     };
-    source.connect(processor);
-    processor.connect(audioCtx.destination); // required in some browsers for processing to run
-    // Mute output by gain 0
     const mute = audioCtx.createGain();
     mute.gain.value = 0;
-    processor.disconnect();
     source.connect(processor);
     processor.connect(mute);
     mute.connect(audioCtx.destination);
@@ -85,10 +82,9 @@ export async function runMicPcg(
             ? 'Press mic firmly on bare chest skin…'
             : 'Listening for heart sounds…';
 
-        // Occasional partial analysis after ~8s
         if (elapsed > 8 && rawChunks.length > 10 && Math.floor(elapsed * 5) % 7 === 0) {
           const partial = analyzePcg(mergeChunks(rawChunks), sampleRate);
-          if (partial.bpm != null) {
+          if (partial.bpm != null && partial.confidence >= 0.3) {
             bpmLive = partial.bpm;
             quality = partial.quality;
             status = `Live ~${Math.round(partial.bpm)} BPM (S1–S1)`;
@@ -145,7 +141,6 @@ function mergeChunks(chunks: Float32Array[]): Float32Array {
   return out;
 }
 
-/** Downsample by averaging blocks for envelope processing efficiency. */
 function downsample(signal: Float32Array, fromFs: number, toFs: number): {
   data: Float32Array;
   fs: number;
@@ -161,6 +156,37 @@ function downsample(signal: Float32Array, fromFs: number, toFs: number): {
     data[i] = sum / ratio;
   }
   return { data, fs };
+}
+
+/** Reject segments whose RMS is far from median (noise bursts). */
+function maskNoisySegments(
+  signal: Float32Array,
+  fs: number,
+  segSec = 0.5,
+): Float32Array {
+  const seg = Math.max(8, Math.round(segSec * fs));
+  const nSeg = Math.floor(signal.length / seg);
+  if (nSeg < 3) return signal;
+
+  const rms: number[] = [];
+  for (let s = 0; s < nSeg; s++) {
+    let sq = 0;
+    const base = s * seg;
+    for (let i = 0; i < seg; i++) sq += signal[base + i] ** 2;
+    rms.push(Math.sqrt(sq / seg));
+  }
+  const sorted = [...rms].sort((a, b) => a - b);
+  const med = sorted[Math.floor(sorted.length / 2)] || 1e-12;
+
+  const out = new Float32Array(signal.length);
+  out.set(signal);
+  for (let s = 0; s < nSeg; s++) {
+    if (rms[s] > med * 3.5 || rms[s] < med * 0.15) {
+      const base = s * seg;
+      for (let i = 0; i < seg; i++) out[base + i] = 0;
+    }
+  }
+  return out;
 }
 
 function analyzePcg(
@@ -185,69 +211,75 @@ function analyzePcg(
     };
   }
 
-  // Bandpass 20–200 Hz at original rate (or lightly downsampled)
-  const targetFs = Math.min(sampleRate, 2000);
+  // Tighter heart-sound band; downsample for efficiency
+  const targetFs = Math.min(sampleRate, 1000);
   const { data: ds, fs } = downsample(pcm, sampleRate, targetFs);
-  const bp = new BandpassFilter(20, 200, fs, true).processBuffer(ds);
+  const cleaned = maskNoisySegments(ds, fs, 0.4);
+  const bp = filtfiltBandpass(cleaned, 25, 150, fs);
 
-  // Shannon energy envelope, smooth ~30–50 ms
-  const env = beatEnvelope(bp, fs, 45);
-  const norm = normalize(env);
+  // Hilbert + Shannon envelope, ~40 ms smooth
+  const env = beatEnvelope(bp, fs, 40, true);
+  const norm = normalize(savitzkyGolay(env, Math.min(11, Math.max(5, Math.round(fs * 0.02) | 1))));
 
-  // Detect lobe peaks (S1 and S2) — allow up to ~4 Hz for paired sounds
   const lobes = detectPeaks(norm, {
     fs,
-    minBpm: 40, // will filter via pairing
-    maxBpm: 240, // allow S1+S2 rate temporarily
-    thresholdRatio: 0.35,
+    minBpm: 40,
+    maxBpm: 240,
+    thresholdRatio: 0.32,
     adaptWindowSec: 1.0,
   });
 
   const s1Peaks = labelS1S2(lobes);
-  const s1Intervals: number[] = [];
-  for (let i = 1; i < s1Peaks.length; i++) {
-    const dt = s1Peaks[i].timeSec - s1Peaks[i - 1].timeSec;
-    const bpm = 60 / dt;
-    if (bpm >= 40 && bpm <= 180) s1Intervals.push(dt);
-  }
+  const { bpm: s1Bpm, cv } = bpmFromPeaks(s1Peaks, 40, 180);
 
-  let bpm: number | null = null;
-  if (s1Intervals.length >= 2) {
-    const sorted = [...s1Intervals].sort((a, b) => a - b);
-    const median = sorted[Math.floor(sorted.length / 2)];
-    bpm = 60 / median;
-  }
-
-  // Spectral check on envelope (heart rate band)
+  // Autocorr + spectral on downsampled envelope
   const envFsDown = downsample(norm, fs, 50);
-  const { peak: spec, magnitudes, freqs } = spectralPeak(
-    envFsDown.data,
-    envFsDown.fs,
-    0.7,
-    3.0,
-    4,
-  );
-  const snrDb = spec
-    ? spectralSnrDb(magnitudes, freqs, spec.bin, 0.7, 3.0)
-    : timeDomainSnrDb(norm, lobes);
+  const ac = autocorrHeartRate(envFsDown.data, envFsDown.fs, 0.67, 3.0);
+  const harm = spectralPeakHarmonicAware(envFsDown.data, envFsDown.fs, 0.67, 3.0, true);
+  const snrDb = harm?.snrDb ?? 0;
 
-  if (bpm == null && spec) bpm = spec.bpm;
+  let bpm: number | null = s1Bpm;
+  if (bpm == null && ac.bpm != null) bpm = ac.bpm;
+  if (bpm == null && harm) bpm = harm.bpm;
 
-  const fakePeaksForReg = s1Peaks;
+  // Prefer S1–S1 when it agrees with autocorr
+  if (s1Bpm != null && ac.bpm != null) {
+    if (Math.abs(s1Bpm - ac.bpm) <= 10) {
+      bpm = 0.6 * s1Bpm + 0.4 * ac.bpm;
+    } else if (ac.confidence > 0.55 && s1Peaks.length < 4) {
+      bpm = ac.bpm;
+    }
+  }
+
+  // Harmonic check vs spectral
+  if (bpm != null && harm) {
+    const ratio = bpm / harm.bpm;
+    if (ratio > 1.85 && ratio < 2.15) bpm = harm.bpm; // was double
+    if (ratio > 0.45 && ratio < 0.55) bpm = harm.bpm; // was half
+  }
+
   const quality = combineQuality({
     spectralSnrDb: snrDb,
     timeSnrDb: timeDomainSnrDb(norm, lobes),
-    regularity: regularityScore(fakePeaksForReg, 40, 180),
+    regularity: regularityScore(s1Peaks, 40, 180),
     agreement:
-      bpm != null && spec
-        ? Math.max(0, 1 - Math.abs(bpm - spec.bpm) / 20)
-        : 0.3,
+      bpm != null && ac.bpm != null
+        ? Math.max(0, 1 - Math.abs(bpm - ac.bpm) / 20)
+        : 0.25,
   });
+
+  let confidence = bpm != null ? quality : 0;
+  if (cv > 0.35) confidence *= 0.65;
+  if (s1Peaks.length < 3) confidence *= 0.6;
+  if (confidence < 0.22) {
+    bpm = null;
+    confidence = 0;
+  }
 
   return {
     bpm: bpm != null ? Math.round(bpm * 10) / 10 : null,
     quality,
-    confidence: bpm != null ? quality : 0,
+    confidence,
     s1Count: s1Peaks.length,
     snrDb,
     notes:
@@ -259,7 +291,6 @@ function analyzePcg(
 
 /**
  * Systole (S1→S2) is shorter than diastole (S2→S1).
- * Walk consecutive lobe pairs and assign S1 to the start of the shorter gap.
  */
 function labelS1S2(lobes: Peak[]): Peak[] {
   if (lobes.length < 3) return lobes;
@@ -269,7 +300,6 @@ function labelS1S2(lobes: Peak[]): Peak[] {
     intervals.push(lobes[i].timeSec - lobes[i - 1].timeSec);
   }
 
-  // Find which phase is systole: among alternating interval groups, shorter mean = systole
   let sumEven = 0;
   let sumOdd = 0;
   let nEven = 0;
@@ -286,20 +316,15 @@ function labelS1S2(lobes: Peak[]): Peak[] {
   const meanEven = nEven ? sumEven / nEven : 0;
   const meanOdd = nOdd ? sumOdd / nOdd : 0;
 
-  // If even intervals are shorter → they are systole → S1 at even indices (0,2,4…)
-  // If odd intervals are shorter → S1 at odd starts (1,3,5…) i.e. peaks at index 1,3,…
   const evenIsSystole = meanEven > 0 && meanEven <= meanOdd;
   const s1: Peak[] = [];
 
   if (evenIsSystole) {
-    // Pattern: S1, S2, S1, S2… starting at lobe 0
     for (let i = 0; i < lobes.length; i += 2) s1.push(lobes[i]);
   } else {
-    // Pattern starts mid-cycle: first lobe may be S2
     for (let i = 1; i < lobes.length; i += 2) s1.push(lobes[i]);
   }
 
-  // Sanity: S1–S1 should be ~0.33–1.5 s. If not, try alternate phasing.
   if (s1.length >= 3) {
     const dt = s1[1].timeSec - s1[0].timeSec;
     if (dt < 0.28 || dt > 1.6) {

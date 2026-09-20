@@ -1,6 +1,7 @@
 /**
  * Cascaded biquad IIR filters (Butterworth-style).
  * Direct Form II Transposed for numerical stability.
+ * Coefficients are always computed for the actual sample rate Fs.
  */
 
 export interface BiquadCoeffs {
@@ -18,7 +19,9 @@ export interface BiquadState {
 
 /** Second-order Butterworth low-pass at cutoff Hz. */
 export function butterworthLowpass(fc: number, fs: number): BiquadCoeffs {
-  const w0 = (2 * Math.PI * fc) / fs;
+  const nyquist = fs / 2;
+  const clipped = Math.min(fc, nyquist * 0.95);
+  const w0 = (2 * Math.PI * clipped) / fs;
   const cos = Math.cos(w0);
   const sin = Math.sin(w0);
   const alpha = sin / Math.SQRT2; // Q = 1/√2
@@ -33,7 +36,9 @@ export function butterworthLowpass(fc: number, fs: number): BiquadCoeffs {
 
 /** Second-order Butterworth high-pass at cutoff Hz. */
 export function butterworthHighpass(fc: number, fs: number): BiquadCoeffs {
-  const w0 = (2 * Math.PI * fc) / fs;
+  const nyquist = fs / 2;
+  const clipped = Math.min(Math.max(fc, 0.01), nyquist * 0.95);
+  const w0 = (2 * Math.PI * clipped) / fs;
   const cos = Math.cos(w0);
   const sin = Math.sin(w0);
   const alpha = sin / Math.SQRT2;
@@ -63,13 +68,20 @@ export class BandpassFilter {
   private lp: BiquadCoeffs;
   private hpState: BiquadState;
   private lpState: BiquadState;
-  /** Optional second cascade for steeper roll-off. */
   private hp2: BiquadCoeffs | null = null;
   private lp2: BiquadCoeffs | null = null;
   private hp2State: BiquadState | null = null;
   private lp2State: BiquadState | null = null;
+  private fs: number;
+  private cascaded: boolean;
+  private lowHz: number;
+  private highHz: number;
 
   constructor(lowHz: number, highHz: number, fs: number, cascaded = true) {
+    this.fs = fs;
+    this.cascaded = cascaded;
+    this.lowHz = lowHz;
+    this.highHz = highHz;
     this.hp = butterworthHighpass(lowHz, fs);
     this.lp = butterworthLowpass(highHz, fs);
     this.hpState = createBiquadState();
@@ -80,6 +92,23 @@ export class BandpassFilter {
       this.hp2State = createBiquadState();
       this.lp2State = createBiquadState();
     }
+  }
+
+  /** Retune cutoffs for adaptive bandpass (keeps state — expect brief transient). */
+  retune(lowHz: number, highHz: number, fs?: number): void {
+    if (fs != null && fs > 0) this.fs = fs;
+    this.lowHz = lowHz;
+    this.highHz = highHz;
+    this.hp = butterworthHighpass(lowHz, this.fs);
+    this.lp = butterworthLowpass(highHz, this.fs);
+    if (this.cascaded) {
+      this.hp2 = butterworthHighpass(lowHz, this.fs);
+      this.lp2 = butterworthLowpass(highHz, this.fs);
+    }
+  }
+
+  getCutoffs(): { lowHz: number; highHz: number; fs: number } {
+    return { lowHz: this.lowHz, highHz: this.highHz, fs: this.fs };
   }
 
   process(x: number): number {
@@ -115,7 +144,6 @@ export function filtfiltBandpass(
 ): Float32Array {
   const fwd = new BandpassFilter(lowHz, highHz, fs, true);
   const forward = fwd.processBuffer(signal);
-  // reverse
   const rev = new Float32Array(forward.length);
   for (let i = 0; i < forward.length; i++) rev[i] = forward[forward.length - 1 - i];
   const bwd = new BandpassFilter(lowHz, highHz, fs, true);
@@ -123,6 +151,23 @@ export function filtfiltBandpass(
   const out = new Float32Array(back.length);
   for (let i = 0; i < back.length; i++) out[i] = back[back.length - 1 - i];
   return out;
+}
+
+/** Adaptive bandpass centered on last confident HR (±bandwidth). */
+export function adaptiveBandHz(
+  lockedBpm: number | null,
+  defaultLow = 0.67,
+  defaultHigh = 3.5,
+  halfWidthHz = 0.55,
+): { low: number; high: number } {
+  if (lockedBpm == null || lockedBpm < 40) {
+    return { low: defaultLow, high: defaultHigh };
+  }
+  const f0 = lockedBpm / 60;
+  return {
+    low: Math.max(defaultLow, f0 - halfWidthHz),
+    high: Math.min(defaultHigh, f0 + halfWidthHz),
+  };
 }
 
 /** Simple moving average for detrending / smoothing. */

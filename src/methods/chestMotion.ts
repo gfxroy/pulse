@@ -1,19 +1,21 @@
 /**
- * Chest-placed phone: bandpass accel Z + Shannon/RMS envelope,
- * parallel gyro pipeline, cross-validate beats before accepting.
+ * Chest-placed phone: bandpass accel + Hilbert/Shannon envelope,
+ * parallel gyro pipeline, true coincidence window, autocorr + harmonic checks.
  */
 
-import { BandpassFilter, normalize } from '../dsp/filters';
+import { normalize, filtfiltBandpass } from '../dsp/filters';
 import { beatEnvelope } from '../dsp/envelope';
 import { detectPeaks, bpmFromPeaks, crossValidatePeaks } from '../dsp/peaks';
-import { estimateHeartRate } from '../dsp/hrEstimate';
+import { estimateHeartRateSliding, HrTracker } from '../dsp/hrEstimate';
+import { autocorrHeartRate } from '../dsp/autocorr';
 import { combineQuality, timeDomainSnrDb, regularityScore, bpmAgreement } from '../dsp/quality';
-import { spectralPeak, spectralSnrDb } from '../dsp/fft';
+import { spectralPeakHarmonicAware } from '../dsp/welch';
+import { savitzkyGolay, linearDetrend } from '../dsp/preprocess';
 import type { MethodResult } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
 
-const FS = 50; // target resampled rate
+const FS = 50;
 const DURATION = METHOD_META.chest_motion.durationSec;
 
 export async function runChestMotion(
@@ -23,6 +25,7 @@ export async function runChestMotion(
   const started = Date.now();
   const accelZ: { t: number; v: number }[] = [];
   const gyroMag: { t: number; v: number }[] = [];
+  const tracker = new HrTracker(6);
 
   const onMotion = (e: DeviceMotionEvent) => {
     const t = (Date.now() - started) / 1000;
@@ -39,6 +42,7 @@ export async function runChestMotion(
 
   const waveformWindow: number[] = [];
   let intervalId = 0;
+  let lockedBpm: number | null = null;
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -53,7 +57,6 @@ export async function runChestMotion(
           return;
         }
 
-        // Live preview from recent accel
         const recent = accelZ.filter((s) => s.t > elapsed - 3);
         if (recent.length > 10) {
           const vals = recent.map((s) => s.v);
@@ -71,11 +74,13 @@ export async function runChestMotion(
             : 'Recording chest motion… stay still';
 
         if (accelZ.length > FS * 8) {
-          const partial = processMotionBuffers(accelZ, gyroMag, started);
-          if (partial.bpm != null) {
-            bpmLive = partial.bpm;
+          const partial = processMotionBuffers(accelZ, gyroMag, lockedBpm);
+          if (partial.bpm != null && partial.confidence >= 0.25) {
+            const stable = tracker.push(partial.bpm, 0.25, partial.confidence);
+            bpmLive = stable ?? partial.bpm;
             quality = partial.quality;
-            status = `Live ~${Math.round(partial.bpm)} BPM (${partial.matchedPeaks} consensus beats)`;
+            if (partial.confidence >= 0.5) lockedBpm = bpmLive;
+            status = `Live ~${Math.round(bpmLive)} BPM (${partial.matchedPeaks} consensus beats)`;
           }
         }
 
@@ -94,7 +99,7 @@ export async function runChestMotion(
   }
 
   const durationSec = (Date.now() - started) / 1000;
-  const result = processMotionBuffers(accelZ, gyroMag, started);
+  const result = processMotionBuffers(accelZ, gyroMag, lockedBpm);
 
   return {
     methodId: 'chest_motion',
@@ -131,7 +136,7 @@ function resample(series: { t: number; v: number }[], fs: number): Float32Array 
 function processMotionBuffers(
   accelZ: { t: number; v: number }[],
   gyroMag: { t: number; v: number }[],
-  _started: number,
+  lockedBpm: number | null,
 ): {
   bpm: number | null;
   quality: number;
@@ -153,40 +158,44 @@ function processMotionBuffers(
     };
   }
 
-  // Accel Z: bandpass 1–20 Hz (heart sounds / ballistocardiographic impulses)
-  const accelBp = new BandpassFilter(1.0, 20, FS, true).processBuffer(az);
-  const accelEnv = beatEnvelope(accelBp, FS, 35);
-  const accelNorm = normalize(accelEnv);
+  // Accel: bandpass for BCG impulses then Hilbert/Shannon envelope
+  const accelBp = filtfiltBandpass(az, 0.8, 18, FS);
+  const accelEnv = beatEnvelope(accelBp, FS, 35, true);
+  const accelNorm = normalize(savitzkyGolay(linearDetrend(accelEnv), 7));
 
-  // Gyro: bandpass 1–15 Hz then envelope
   let gyroNorm: Float32Array | null = null;
   if (gz.length >= FS * 5) {
-    const gyroBp = new BandpassFilter(1.0, 15, FS, true).processBuffer(gz);
-    gyroNorm = normalize(beatEnvelope(gyroBp, FS, 40));
+    const gyroBp = filtfiltBandpass(gz, 0.8, 15, FS);
+    gyroNorm = normalize(savitzkyGolay(beatEnvelope(gyroBp, FS, 40, true), 7));
   }
 
   const accelPeaks = detectPeaks(accelNorm, {
     fs: FS,
     minBpm: 40,
     maxBpm: 180,
-    thresholdRatio: 0.4,
+    thresholdRatio: 0.38,
     adaptWindowSec: 1.5,
+    expectedBpm: lockedBpm,
   });
 
   let consensusPeaks = accelPeaks;
   let notes: string | undefined;
+  let crossOk = false;
 
   if (gyroNorm) {
     const gyroPeaks = detectPeaks(gyroNorm, {
       fs: FS,
       minBpm: 40,
       maxBpm: 180,
-      thresholdRatio: 0.4,
+      thresholdRatio: 0.38,
       adaptWindowSec: 1.5,
+      expectedBpm: lockedBpm,
     });
-    const matched = crossValidatePeaks(accelPeaks, gyroPeaks, 0.15);
+    // Tighter coincidence window (true accel↔gyro agreement)
+    const matched = crossValidatePeaks(accelPeaks, gyroPeaks, 0.1);
     if (matched.length >= 3) {
       consensusPeaks = matched;
+      crossOk = true;
     } else if (accelPeaks.length >= 4) {
       notes = 'Gyro cross-check weak — using accel with reduced confidence';
       consensusPeaks = accelPeaks;
@@ -195,17 +204,39 @@ function processMotionBuffers(
     }
   }
 
-  const { bpm: timeBpm } = bpmFromPeaks(consensusPeaks, 40, 180);
-  const est = estimateHeartRate(accelNorm, { fs: FS, fMin: 0.7, fMax: 3.0 });
-  const { peak: spec, magnitudes, freqs } = spectralPeak(accelNorm, FS, 0.7, 3.0, 4);
-  const snrDb = spec ? spectralSnrDb(magnitudes, freqs, spec.bin, 0.7, 3.0) : est.snrDb;
+  const { bpm: timeBpm, cv } = bpmFromPeaks(consensusPeaks, 40, 180);
+
+  const est = estimateHeartRateSliding(
+    accelNorm,
+    { fs: FS, fMin: 0.67, fMax: 3.0, lockedBpm, useWelch: true },
+    8,
+    2,
+  );
+
+  const ac = autocorrHeartRate(accelNorm, FS, 0.67, 3.0);
+  const harm = spectralPeakHarmonicAware(accelNorm, FS, 0.67, 3.0, true);
+  const snrDb = harm?.snrDb ?? est.snrDb;
   const tSnr = timeDomainSnrDb(accelNorm, consensusPeaks);
   const reg = regularityScore(consensusPeaks);
-  const agreement = bpmAgreement(timeBpm, est.spectralBpm, 10);
+  const agreement = bpmAgreement(timeBpm, est.spectralBpm ?? ac.bpm, 10);
 
-  let bpm = timeBpm ?? est.bpm;
-  if (timeBpm != null && est.spectralBpm != null && Math.abs(timeBpm - est.spectralBpm) <= 8) {
-    bpm = 0.55 * timeBpm + 0.45 * est.spectralBpm;
+  // Reconcile interval / autocorr / spectral with harmonic checks
+  const cands: { bpm: number; w: number }[] = [];
+  if (timeBpm != null && consensusPeaks.length >= 3) {
+    cands.push({ bpm: timeBpm, w: crossOk ? 1.2 : 0.8 });
+  }
+  if (ac.bpm != null) cands.push({ bpm: ac.bpm, w: 1.0 * ac.confidence });
+  if (harm) cands.push({ bpm: harm.bpm, w: 0.9 * Math.min(1, snrDb / 12) });
+  if (est.bpm != null) cands.push({ bpm: est.bpm, w: 0.85 * est.confidence });
+
+  let bpm: number | null = null;
+  if (cands.length > 0) {
+    // Outlier-reject among candidates
+    cands.sort((a, b) => b.w - a.w);
+    const primary = cands[0].bpm;
+    const cluster = cands.filter((c) => Math.abs(c.bpm - primary) <= 12);
+    const wSum = cluster.reduce((a, c) => a + c.w, 0) || 1;
+    bpm = cluster.reduce((a, c) => a + c.bpm * c.w, 0) / wSum;
   }
 
   let quality = combineQuality({
@@ -215,14 +246,18 @@ function processMotionBuffers(
     agreement,
   });
 
-  // Boost when cross-validated
-  if (gyroNorm && consensusPeaks.length >= 4 && !notes?.includes('weak')) {
-    quality = Math.min(1, quality + 0.08);
+  if (crossOk && consensusPeaks.length >= 4) {
+    quality = Math.min(1, quality + 0.1);
   } else if (notes?.includes('weak')) {
-    quality *= 0.75;
+    quality *= 0.7;
   }
 
-  const confidence = bpm != null ? quality : 0;
+  let confidence = bpm != null ? quality : 0;
+  if (cv > 0.3) confidence *= 0.7;
+  if (confidence < 0.2) {
+    bpm = null;
+    confidence = 0;
+  }
 
   return {
     bpm: bpm != null ? Math.round(bpm * 10) / 10 : null,

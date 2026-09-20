@@ -1,17 +1,29 @@
 /**
- * Facial remote PPG using POS (Plane-Orthogonal-to-Skin) algorithm.
- * FaceDetector API when available; else center-face fallback ROI.
+ * Facial remote PPG: POS + CHROM fusion by quality.
+ * Timestamps with performance.now(); Fs derived from timestamps.
+ * Better cheek/forehead ROI, skin gating, motion rejection.
  */
 
-import { BandpassFilter, normalize, detrend } from '../dsp/filters';
-import { estimateHeartRate } from '../dsp/hrEstimate';
+import {
+  BandpassFilter,
+  normalize,
+  filtfiltBandpass,
+  adaptiveBandHz,
+} from '../dsp/filters';
+import { estimateHeartRateSliding, HrTracker } from '../dsp/hrEstimate';
+import {
+  robustSampleRate,
+  linearDetrend,
+  savitzkyGolay,
+  highpassMa,
+} from '../dsp/preprocess';
 import type { CameraCueLevel, MethodResult, NormRect } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
 
-const TARGET_FPS = 30;
 const DURATION = METHOD_META.facial_rppg.durationSec;
-const WIN = 48; // ~1.6 s temporal window for POS
+const WIN = 64; // ~2 s temporal window for POS/CHROM at ~30 fps
+const FS_SEED = 30;
 
 interface Roi {
   x: number;
@@ -42,23 +54,146 @@ function toNorm(roi: Roi, vw: number, vh: number): NormRect {
   };
 }
 
+function meanStd(arr: number[]): { mean: number; std: number } {
+  const mean = arr.reduce((a, c) => a + c, 0) / (arr.length || 1);
+  let v = 0;
+  for (const x of arr) v += (x - mean) ** 2;
+  return { mean, std: Math.sqrt(v / (arr.length || 1)) || 1 };
+}
+
+/** POS: Plane-Orthogonal-to-Skin (de Haan & Jeanne). */
+function posSample(
+  r: number,
+  g: number,
+  b: number,
+  winR: number[],
+  winG: number[],
+  winB: number[],
+): number {
+  const mR = meanStd(winR).mean;
+  const mG = meanStd(winG).mean;
+  const mB = meanStd(winB).mean;
+  const recentS1: number[] = [];
+  const recentS2: number[] = [];
+  for (let i = 0; i < winR.length; i++) {
+    const nr = winR[i] / (mR || 1);
+    const ng = winG[i] / (mG || 1);
+    const nb = winB[i] / (mB || 1);
+    recentS1.push(ng - nb);
+    recentS2.push(ng + nb - 2 * nr);
+  }
+  const s1 = g / (mG || 1) - b / (mB || 1);
+  const s2 = g / (mG || 1) + b / (mB || 1) - 2 * (r / (mR || 1));
+  const alpha = meanStd(recentS1).std / meanStd(recentS2).std;
+  return s1 - alpha * s2;
+}
+
+/** CHROM: Chrominance method (de Haan & Jeanne). */
+function chromSample(
+  r: number,
+  g: number,
+  b: number,
+  winR: number[],
+  winG: number[],
+  winB: number[],
+): number {
+  const mR = meanStd(winR).mean || 1;
+  const mG = meanStd(winG).mean || 1;
+  const mB = meanStd(winB).mean || 1;
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (let i = 0; i < winR.length; i++) {
+    const rn = winR[i] / mR;
+    const gn = winG[i] / mG;
+    const bn = winB[i] / mB;
+    xs.push(rn - gn);
+    ys.push(rn + gn - 2 * bn);
+  }
+  const sx = meanStd(xs).std;
+  const sy = meanStd(ys).std;
+  const alpha = sx / (sy || 1e-6);
+  const rn = r / mR;
+  const gn = g / mG;
+  const bn = b / mB;
+  const x = rn - gn;
+  const y = rn + gn - 2 * bn;
+  return x - alpha * y;
+}
+
+/** Cheap skin-ish pixel gate: R>G>B-ish and not too dark/bright. */
+function skinMean(
+  data: Uint8ClampedArray,
+): { r: number; g: number; b: number; skinFrac: number } {
+  let sR = 0;
+  let sG = 0;
+  let sB = 0;
+  let skin = 0;
+  let total = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    total++;
+    // Loose skin heuristic (works without ML deps)
+    const isSkin =
+      r > 60 &&
+      g > 30 &&
+      b > 20 &&
+      r > g &&
+      r > b &&
+      r - g > 8 &&
+      r < 250 &&
+      g < 230;
+    if (isSkin) {
+      sR += r;
+      sG += g;
+      sB += b;
+      skin++;
+    }
+  }
+  if (skin < total * 0.08) {
+    // Fallback: all pixels
+    sR = sG = sB = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      sR += data[i];
+      sG += data[i + 1];
+      sB += data[i + 2];
+    }
+    return {
+      r: sR / total,
+      g: sG / total,
+      b: sB / total,
+      skinFrac: skin / total,
+    };
+  }
+  return {
+    r: sR / skin,
+    g: sG / skin,
+    b: sB / skin,
+    skinFrac: skin / total,
+  };
+}
+
 export async function runFacialRppg(
   onLive: LiveCallback,
   signal: AbortSignal,
 ): Promise<MethodResult> {
-  const started = Date.now();
+  const started = performance.now();
   let stream: MediaStream | null = null;
   let video: HTMLVideoElement | null = null;
   let canvas: HTMLCanvasElement | null = null;
   let raf = 0;
 
-  const rawR: number[] = [];
-  const rawG: number[] = [];
-  const rawB: number[] = [];
+  const timestamps: number[] = [];
   const posSignal: number[] = [];
-  const filter = new BandpassFilter(0.7, 3.5, TARGET_FPS, true);
+  const chromSignal: number[] = [];
+  let filterFs = FS_SEED;
+  let posFilter = new BandpassFilter(0.7, 3.0, FS_SEED, true);
+  let chromFilter = new BandpassFilter(0.7, 3.0, FS_SEED, true);
   const waveformWindow: number[] = [];
   const recentPos: number[] = [];
+  const tracker = new HrTracker(7);
+  let lockedBpm: number | null = null;
 
   let detector: FaceDetector | null = null;
   if (typeof FaceDetector !== 'undefined') {
@@ -69,7 +204,6 @@ export async function runFacialRppg(
     }
   }
 
-  // Sliding buffers for POS
   const winR: number[] = [];
   const winG: number[] = [];
   const winB: number[] = [];
@@ -80,7 +214,7 @@ export async function runFacialRppg(
         facingMode: { ideal: 'user' },
         width: { ideal: 640 },
         height: { ideal: 480 },
-        frameRate: { ideal: TARGET_FPS },
+        frameRate: { ideal: 30, max: 60 },
       },
       audio: false,
     });
@@ -97,6 +231,7 @@ export async function runFacialRppg(
     let lastRoi: Roi | null = null;
     let lastFaceBox: Roi | null = null;
     let faceMissStreak = 0;
+    let prevRoiCenter: { x: number; y: number } | null = null;
 
     await new Promise<void>((resolve, reject) => {
       const tick = async () => {
@@ -104,7 +239,8 @@ export async function runFacialRppg(
           reject(new DOMException('Aborted', 'AbortError'));
           return;
         }
-        const elapsed = (Date.now() - started) / 1000;
+        const now = performance.now();
+        const elapsed = (now - started) / 1000;
         if (elapsed >= DURATION) {
           resolve();
           return;
@@ -118,24 +254,18 @@ export async function runFacialRppg(
           ctx.drawImage(video!, 0, 0);
           frameCount++;
 
-          // Detect face every ~10 frames
-          if (detector && frameCount % 10 === 0) {
+          if (detector && frameCount % 8 === 0) {
             try {
               const faces = await detector.detect(canvas!);
               if (faces.length > 0) {
                 const b = faces[0].boundingBox;
-                lastFaceBox = {
-                  x: b.x,
-                  y: b.y,
-                  w: b.width,
-                  h: b.height,
-                };
-                // Forehead + upper cheeks: top 55% of face, inset horizontally
+                lastFaceBox = { x: b.x, y: b.y, w: b.width, h: b.height };
+                // Forehead band + upper cheeks (avoid mouth/eyes motion)
                 lastRoi = {
-                  x: Math.floor(b.x + b.width * 0.15),
-                  y: Math.floor(b.y + b.height * 0.08),
-                  w: Math.floor(b.width * 0.7),
-                  h: Math.floor(b.height * 0.45),
+                  x: Math.floor(b.x + b.width * 0.18),
+                  y: Math.floor(b.y + b.height * 0.1),
+                  w: Math.floor(b.width * 0.64),
+                  h: Math.floor(b.height * 0.42),
                 };
                 faceMissStreak = 0;
               } else {
@@ -146,7 +276,7 @@ export async function runFacialRppg(
                 }
               }
             } catch {
-              /* ignore detect errors */
+              /* ignore */
             }
           }
 
@@ -160,29 +290,29 @@ export async function runFacialRppg(
           const roi: Roi = lastRoi ?? guideRoi;
           const faceDetected = lastRoi != null;
 
+          // Reject frames with large ROI jump (motion)
+          const cx = roi.x + roi.w / 2;
+          const cy = roi.y + roi.h / 2;
+          let roiJump = false;
+          if (prevRoiCenter && faceDetected) {
+            const dx = (cx - prevRoiCenter.x) / vw;
+            const dy = (cy - prevRoiCenter.y) / vh;
+            if (Math.hypot(dx, dy) > 0.04) roiJump = true;
+          }
+          if (faceDetected) prevRoiCenter = { x: cx, y: cy };
+
           const img = ctx.getImageData(
             Math.max(0, roi.x),
             Math.max(0, roi.y),
             Math.min(roi.w, vw - roi.x),
             Math.min(roi.h, vh - roi.y),
           );
-          let sR = 0;
-          let sG = 0;
-          let sB = 0;
-          const d = img.data;
-          const px = img.width * img.height || 1;
-          for (let i = 0; i < d.length; i += 4) {
-            sR += d[i];
-            sG += d[i + 1];
-            sB += d[i + 2];
-          }
-          const r = sR / px;
-          const g = sG / px;
-          const b = sB / px;
-          rawR.push(r);
-          rawG.push(g);
-          rawB.push(b);
+          const skin = skinMean(img.data);
+          const r = skin.r;
+          const g = skin.g;
+          const b = skin.b;
 
+          timestamps.push(now);
           winR.push(r);
           winG.push(g);
           winB.push(b);
@@ -192,49 +322,38 @@ export async function runFacialRppg(
             winB.shift();
           }
 
-          let posSample = 0;
-          if (winR.length >= WIN) {
-            // Temporal normalization
-            const mean = (arr: number[]) => arr.reduce((a, c) => a + c, 0) / arr.length;
-            const mR = mean(winR);
-            const mG = mean(winG);
-            const mB = mean(winB);
-            const nR = r / (mR || 1);
-            const nG = g / (mG || 1);
-            const nB = b / (mB || 1);
-            // POS projection: S1 = G̃ - B̃, S2 = G̃ + B̃ - 2R̃
-            const s1 = nG - nB;
-            const s2 = nG + nB - 2 * nR;
-            // α = σ(S1)/σ(S2) over window — approximate with recent values
-            const recentS1: number[] = [];
-            const recentS2: number[] = [];
-            for (let i = 0; i < winR.length; i++) {
-              const nr = winR[i] / (mR || 1);
-              const ng = winG[i] / (mG || 1);
-              const nb = winB[i] / (mB || 1);
-              recentS1.push(ng - nb);
-              recentS2.push(ng + nb - 2 * nr);
+          // Retune Fs
+          if (timestamps.length === 40 || (timestamps.length > 40 && timestamps.length % 30 === 0)) {
+            const fsEst = robustSampleRate(timestamps, 'ms');
+            if (fsEst >= 12 && fsEst <= 90 && Math.abs(fsEst - filterFs) > 1.5) {
+              filterFs = fsEst;
+              const band = adaptiveBandHz(lockedBpm, 0.7, 3.0, 0.55);
+              posFilter = new BandpassFilter(band.low, band.high, filterFs, true);
+              chromFilter = new BandpassFilter(band.low, band.high, filterFs, true);
             }
-            const std = (arr: number[]) => {
-              const m = mean(arr);
-              let v = 0;
-              for (const x of arr) v += (x - m) ** 2;
-              return Math.sqrt(v / arr.length) || 1;
-            };
-            const alpha = std(recentS1) / std(recentS2);
-            posSample = s1 - alpha * s2;
           }
 
-          const filtered = filter.process(posSample);
-          posSignal.push(filtered);
-          waveformWindow.push(filtered);
+          let posS = 0;
+          let chromS = 0;
+          if (winR.length >= WIN && !roiJump) {
+            posS = posSample(r, g, b, winR, winG, winB);
+            chromS = chromSample(r, g, b, winR, winG, winB);
+          }
+
+          const posF = posFilter.process(posS);
+          const chromF = chromFilter.process(chromS);
+          posSignal.push(posF);
+          chromSignal.push(chromF);
+
+          // Display blend
+          const display = 0.6 * posF + 0.4 * chromF;
+          waveformWindow.push(display);
           if (waveformWindow.length > 90) waveformWindow.shift();
 
-          recentPos.push(filtered);
-          if (recentPos.length > TARGET_FPS) recentPos.shift();
+          recentPos.push(display);
+          if (recentPos.length > 40) recentPos.shift();
           const motionVar = recentVariance(recentPos);
 
-          // Face size: fraction of frame area
           const faceAreaFrac = lastFaceBox
             ? (lastFaceBox.w * lastFaceBox.h) / (vw * vh)
             : 0;
@@ -250,37 +369,78 @@ export async function runFacialRppg(
           } else if (faceDetected && faceAreaFrac > 0 && faceAreaFrac < 0.06) {
             status = 'Move closer';
             cueLevel = 'warn';
+          } else if (roiJump) {
+            status = 'Hold still';
+            cueLevel = 'warn';
           } else if (faceDetected || !detector) {
             status = 'Hold still';
             cueLevel = 'warn';
           }
 
-          if (posSignal.length > TARGET_FPS * 6) {
-            const slice = posSignal.slice(-Math.min(posSignal.length, TARGET_FPS * 20));
-            const est = estimateHeartRate(normalize(detrend(slice, Math.round(TARGET_FPS * 1.2))), {
-              fs: TARGET_FPS,
-              fMin: 0.75,
-              fMax: 3.0,
-            });
-            quality = est.quality * (faceDetected || !detector ? 1 : 0.7);
-            bpmLive = est.bpm;
+          const fs = filterFs;
+          if (posSignal.length > fs * 7 && !roiJump) {
+            const nWin = Math.min(posSignal.length, Math.round(fs * 18));
+            const sliceTs = timestamps.slice(-nWin);
+            const fsWin = robustSampleRate(sliceTs, 'ms') || fs;
+            const band = adaptiveBandHz(lockedBpm, 0.7, 3.0, 0.55);
 
-            if ((faceDetected || !detector) && faceAreaFrac >= 0.06) {
-              if (est.quality >= 0.4 && est.bpm && motionVar < 0.08) {
+            const prep = (sig: number[]) => {
+              const slice = sig.slice(-nWin);
+              let x = filtfiltBandpass(slice, band.low, band.high, fsWin);
+              x = highpassMa(x, Math.round(fsWin * 1.2));
+              x = savitzkyGolay(x, 7);
+              return normalize(linearDetrend(x));
+            };
+
+            const posEst = estimateHeartRateSliding(
+              prep(posSignal),
+              { fs: fsWin, fMin: band.low, fMax: band.high, lockedBpm, useWelch: true },
+              9,
+              2.5,
+            );
+            const chromEst = estimateHeartRateSliding(
+              prep(chromSignal),
+              { fs: fsWin, fMin: band.low, fMax: band.high, lockedBpm, useWelch: true },
+              9,
+              2.5,
+            );
+
+            // Pick by quality / confidence
+            const best =
+              (chromEst.confidence > posEst.confidence + 0.05 ? chromEst : posEst);
+
+            // Soft fuse when both agree
+            let bpm = best.bpm;
+            let conf = best.confidence;
+            let q = best.quality;
+            if (
+              posEst.bpm != null &&
+              chromEst.bpm != null &&
+              Math.abs(posEst.bpm - chromEst.bpm) <= 8
+            ) {
+              const wP = posEst.confidence;
+              const wC = chromEst.confidence;
+              bpm = (posEst.bpm * wP + chromEst.bpm * wC) / (wP + wC || 1);
+              conf = Math.min(1, (wP + wC) / 2 + 0.08);
+              q = Math.min(1, (posEst.quality + chromEst.quality) / 2 + 0.05);
+            }
+
+            const faceOk = faceDetected || !detector;
+            quality = q * (faceOk ? 1 : 0.65) * (skin.skinFrac > 0.15 ? 1 : 0.85);
+            if (bpm != null && conf >= 0.25 && faceOk && faceAreaFrac >= 0.06) {
+              const stable = tracker.push(bpm, 0.25, conf);
+              bpmLive = stable ?? bpm;
+              if (conf >= 0.45 && motionVar < 0.1) {
+                lockedBpm = bpmLive;
                 status = 'Good pulse signal';
                 cueLevel = 'good';
-              } else if (motionVar >= 0.08) {
-                status = 'Hold still';
-                cueLevel = 'warn';
-              } else if (est.bpm) {
+              } else if (motionVar >= 0.1) {
                 status = 'Hold still';
                 cueLevel = 'warn';
               }
             }
           }
 
-          // Mirror: FaceDetector boxes are in unmirrored video space.
-          // Preview is CSS-mirrored, so flip ROI horizontally for overlay alignment.
           const normRoi = toNorm(roi, vw, vh);
           const displayRoi: NormRect = {
             x: 1 - normRoi.x - normRoi.w,
@@ -321,19 +481,84 @@ export async function runFacialRppg(
     if (video) video.srcObject = null;
   }
 
-  const durationSec = (Date.now() - started) / 1000;
-  const drop = Math.min(posSignal.length, Math.round(TARGET_FPS * 2));
-  const usable = normalize(detrend(posSignal.slice(drop), Math.round(TARGET_FPS * 1.2)));
-  const est = estimateHeartRate(usable, { fs: TARGET_FPS, fMin: 0.75, fMax: 3.0 });
+  const durationSec = (performance.now() - started) / 1000;
+  const fs = robustSampleRate(timestamps, 'ms') || filterFs;
+  const drop = Math.min(posSignal.length, Math.round(fs * 2));
+
+  const prepFinal = (sig: number[]) => {
+    const slice = sig.slice(drop);
+    const band = adaptiveBandHz(lockedBpm, 0.7, 3.0, 0.55);
+    let x = filtfiltBandpass(slice, band.low, band.high, fs);
+    x = highpassMa(x, Math.round(fs * 1.2));
+    x = savitzkyGolay(x, 7);
+    return normalize(linearDetrend(x));
+  };
+
+  if (posSignal.length - drop < fs * 5) {
+    return {
+      methodId: 'facial_rppg',
+      bpm: null,
+      quality: 0.05,
+      confidence: 0,
+      durationSec,
+      notes: 'Insufficient facial PPG samples',
+      timestamp: Date.now(),
+    };
+  }
+
+  const posEst = estimateHeartRateSliding(
+    prepFinal(posSignal),
+    { fs, fMin: 0.7, fMax: 3.0, lockedBpm, useWelch: true },
+    10,
+    2.5,
+  );
+  const chromEst = estimateHeartRateSliding(
+    prepFinal(chromSignal),
+    { fs, fMin: 0.7, fMax: 3.0, lockedBpm, useWelch: true },
+    10,
+    2.5,
+  );
+
+  let bpm: number | null;
+  let confidence: number;
+  let quality: number;
+  let snrDb: number;
+  let peakCount: number;
+
+  if (
+    posEst.bpm != null &&
+    chromEst.bpm != null &&
+    Math.abs(posEst.bpm - chromEst.bpm) <= 8
+  ) {
+    const wP = Math.max(0.1, posEst.confidence);
+    const wC = Math.max(0.1, chromEst.confidence);
+    bpm = (posEst.bpm * wP + chromEst.bpm * wC) / (wP + wC);
+    confidence = Math.min(1, (wP + wC) / 2 + 0.1);
+    quality = Math.min(1, (posEst.quality + chromEst.quality) / 2 + 0.05);
+    snrDb = Math.max(posEst.snrDb, chromEst.snrDb);
+    peakCount = Math.max(posEst.peakCount, chromEst.peakCount);
+  } else {
+    const best = chromEst.confidence > posEst.confidence ? chromEst : posEst;
+    bpm = best.bpm;
+    confidence = best.confidence * 0.85;
+    quality = best.quality;
+    snrDb = best.snrDb;
+    peakCount = best.peakCount;
+  }
+
+  if (confidence < 0.2 || (snrDb < 3.5 && peakCount < 4)) {
+    bpm = null;
+    confidence = 0;
+  }
 
   return {
     methodId: 'facial_rppg',
-    bpm: est.bpm,
-    quality: est.quality,
-    confidence: est.confidence,
+    bpm: bpm != null ? Math.round(bpm * 10) / 10 : null,
+    quality,
+    confidence,
     durationSec,
-    peakCount: est.peakCount,
-    snrDb: est.snrDb,
+    peakCount,
+    snrDb,
     timestamp: Date.now(),
   };
 }

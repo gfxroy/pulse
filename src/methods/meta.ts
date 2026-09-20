@@ -6,14 +6,14 @@ export const METHOD_META: Record<MethodId, MethodMeta> = {
     name: 'Fingertip PPG',
     shortName: 'Finger',
     reliabilityRank: 1,
-    durationSec: 20,
+    durationSec: 25,
     requires: ['rearCamera'],
     setupTitle: 'Fingertip over rear camera',
     setupSteps: [
       'Turn on your phone flashlight manually (Control Center / Quick Settings).',
       'Cover the rear camera and flash with your fingertip — gentle, steady pressure.',
       'Keep still. The preview should look glowing red/orange, not black or white.',
-      'Hold for about 20 seconds while we measure.',
+      'Hold for about 25 seconds while we measure.',
     ],
     goodSignalLooksLike:
       'A smooth, rhythmic red-channel waveform with clear peaks ~1 per second. Quality meter rises above 60%.',

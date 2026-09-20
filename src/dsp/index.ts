@@ -4,3 +4,6 @@ export * from './peaks';
 export * from './envelope';
 export * from './quality';
 export * from './hrEstimate';
+export * from './autocorr';
+export * from './welch';
+export * from './preprocess';
