@@ -49,6 +49,8 @@ export interface CameraGuideLive {
   meanRed?: number;
   /** Fingertip: red / (g+b) dominance. */
   redDominance?: number;
+  /** Fingertip: signal too dark — prompt alternate-light guide. */
+  needsAlternateLight?: boolean;
   /** Face: FaceDetector currently has a lock. */
   faceDetected?: boolean;
   /** Face: measured ROI (forehead/cheeks) or guide fallback, normalized. */

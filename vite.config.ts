@@ -1,8 +1,10 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
-// https://vite.dev/config/
+// GitHub Pages: repo will be renamed to `pulse` → https://gfxroy.github.io/pulse/
+// Keep base in sync even before rename so `npm run build` emits correct asset paths.
 export default defineConfig({
+  base: '/pulse/',
   plugins: [react()],
   preview: {
     host: '0.0.0.0',

@@ -145,8 +145,12 @@ function processMotionBuffers(
   snrDb: number;
   notes?: string;
 } {
-  const az = resample(accelZ, FS);
-  const gz = resample(gyroMag, FS);
+  let az = resample(accelZ, FS);
+  let gz = resample(gyroMag, FS);
+  // Discard settle / placement seconds
+  const settle = Math.round(FS * 2.5);
+  if (az.length > settle) az = az.subarray(settle);
+  if (gz.length > settle) gz = gz.subarray(settle);
   if (az.length < FS * 5) {
     return {
       bpm: null,

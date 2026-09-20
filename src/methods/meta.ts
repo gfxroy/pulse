@@ -10,13 +10,12 @@ export const METHOD_META: Record<MethodId, MethodMeta> = {
     requires: ['rearCamera'],
     setupTitle: 'Fingertip over rear camera',
     setupSteps: [
-      'Turn on your phone flashlight manually (Control Center / Quick Settings).',
-      'Cover the rear camera and flash with your fingertip — gentle, steady pressure.',
-      'Keep still. The preview should look glowing red/orange, not black or white.',
-      'Hold for about 25 seconds while we measure.',
+      'Flashlight on — or another phone’s bright light facing the camera.',
+      'Cover the rear lens fully with your fingertip.',
+      'Hold still; preview should glow red/orange.',
     ],
     goodSignalLooksLike:
-      'A smooth, rhythmic red-channel waveform with clear peaks ~1 per second. Quality meter rises above 60%.',
+      'Smooth rhythmic waveform; quality above ~60%.',
   },
   facial_rppg: {
     id: 'facial_rppg',
@@ -27,13 +26,12 @@ export const METHOD_META: Record<MethodId, MethodMeta> = {
     requires: ['frontCamera'],
     setupTitle: 'Face the front camera',
     setupSteps: [
-      'Hold the phone at arm’s length, face well lit (natural light works best).',
-      'Look at the camera; keep your head mostly still.',
-      'Avoid strong backlight or flickering fluorescent lights.',
-      'Stay in frame for about 30 seconds.',
+      'Hold at arm’s length.',
+      'Center face in the oval.',
+      'Even front light; hold still.',
     ],
     goodSignalLooksLike:
-      'A gentle pulsatile waveform after a few seconds of settling. Face ROI outlined. Quality climbing steadily.',
+      'Gentle pulsatile waveform; face ROI locked; quality climbing.',
   },
   chest_motion: {
     id: 'chest_motion',
@@ -44,13 +42,12 @@ export const METHOD_META: Record<MethodId, MethodMeta> = {
     requires: ['motion'],
     setupTitle: 'Phone on sternum (lying down)',
     setupSteps: [
-      'Lie on your back in a quiet place.',
-      'Place the phone flat on your sternum (center of chest), screen up.',
-      'Breathe calmly; minimize talking and movement.',
-      'Remain still for about 25 seconds.',
+      'Lie on your back.',
+      'Phone flat on sternum, screen up.',
+      'Breathe calmly; stay still.',
     ],
     goodSignalLooksLike:
-      'Regular beat spikes on both accel and gyro traces that line up. Consensus peaks accepted.',
+      'Aligned accel/gyro beat spikes; consensus peaks.',
   },
   handheld_accel: {
     id: 'handheld_accel',
@@ -61,13 +58,11 @@ export const METHOD_META: Record<MethodId, MethodMeta> = {
     requires: ['motion'],
     setupTitle: 'Hold phone steadily (least precise)',
     setupSteps: [
-      'Sit or stand comfortably. Hold the phone still against your chest or in a firm grip.',
-      'This method is the least precise — use only if others are unavailable.',
-      'Minimize walking, talking, and hand tremor.',
-      'Hold steady for about 35 seconds (longer averaging).',
+      'Firm grip against chest.',
+      'Minimize tremor — least precise method.',
     ],
     goodSignalLooksLike:
-      'A weak but periodic envelope after strong noise suppression. Expect lower confidence.',
+      'Weak periodic envelope; expect lower confidence.',
     leastPrecise: true,
   },
   mic_pcg: {
@@ -79,13 +74,11 @@ export const METHOD_META: Record<MethodId, MethodMeta> = {
     requires: ['microphone'],
     setupTitle: 'Microphone against bare chest',
     setupSteps: [
-      'Place the phone mic (usually bottom edge) firmly against bare skin over the heart.',
-      'Stay very still and quiet — no talking.',
-      'A soft “lub-dub” should be audible if you listen with headphones.',
-      'Record for about 25 seconds.',
+      'Mic against bare chest skin.',
+      'Quiet room — no talking.',
     ],
     goodSignalLooksLike:
-      'Paired S1–S2 energy lobes; systole shorter than diastole. Regular S1–S1 intervals.',
+      'Paired S1–S2 lobes; regular S1–S1 intervals.',
   },
 };
 

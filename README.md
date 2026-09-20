@@ -20,6 +20,20 @@ Open the printed local URL (Vite defaults to `http://localhost:5173`).
 | `npm run preview` | Preview production build |
 | `npm run lint` | Oxlint                     |
 
+## GitHub Pages (`/pulse/`)
+
+Vite `base` is set to **`/pulse/`** so production assets resolve under:
+
+`https://<user>.github.io/pulse/`
+
+Rename this repository to **`pulse`** (or deploy the `dist/` folder under a `/pulse/` path on Pages). Until rename, local `npm run build` still works; preview with:
+
+```bash
+npm run build && npm run preview
+```
+
+Open Graph / Twitter card meta tags live in `index.html` (title, description, theme-color `#f3ebe0`).
+
 ## HTTPS / localhost notes for sensors
 
 Camera, microphone, and (on iOS) motion permission APIs require a **secure context**:
@@ -49,6 +63,12 @@ Capability probe gates each method separately. Guided scan runs available method
 ## Manual flashlight (fingertip PPG)
 
 This app **never** attempts programmatic torch/flashlight control. For fingertip PPG, turn the flashlight on yourself via Control Center (iOS) or Quick Settings (Android), then cover the rear camera + flash with your fingertip.
+
+**Alternate light:** If the flashlight is unavailable or the preview is too dark, point another phone’s bright screen/flash at the measuring phone’s camera area, then cover the measuring phone’s lens with your fingertip. Transmitted light still works. The app shows a visual guide for this flow when darkness is detected.
+
+## Visual setup guides
+
+Each method opens a **step carousel** of SVG illustrations (phone silhouettes, finger/face/chest stickers) with one short caption per step — not walls of text. Live camera target overlays remain during fingertip and face measurement.
 
 ## Privacy
 

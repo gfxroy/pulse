@@ -483,7 +483,7 @@ export async function runFacialRppg(
 
   const durationSec = (performance.now() - started) / 1000;
   const fs = robustSampleRate(timestamps, 'ms') || filterFs;
-  const drop = Math.min(posSignal.length, Math.round(fs * 2));
+  const drop = Math.min(posSignal.length, Math.round(fs * 3));
 
   const prepFinal = (sig: number[]) => {
     const slice = sig.slice(drop);

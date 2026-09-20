@@ -4,6 +4,8 @@ import { SignalWaveform } from '../components/SignalWaveform';
 import { QualityMeter } from '../components/QualityMeter';
 import { BpmDisplay } from '../components/BpmDisplay';
 import { CameraGuide } from '../components/CameraGuide';
+import { VisualGuide } from '../components/VisualGuide';
+import { PlacementCue } from '../components/PlacementCue';
 import { METHOD_META, runMethod } from '../methods';
 import type { LiveMeasurement, MethodId, MethodResult } from '../types';
 
@@ -23,6 +25,8 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
   const [live, setLive] = useState<LiveMeasurement | null>(null);
   const [result, setResult] = useState<MethodResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showAltLight, setShowAltLight] = useState(false);
+  const [altDismissed, setAltDismissed] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const isCamera = CAMERA_METHODS.includes(methodId);
 
@@ -32,10 +36,25 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
     };
   }, []);
 
+  // Auto-prompt alternate-light guide when PPG is too dark
+  useEffect(() => {
+    if (
+      phase === 'running' &&
+      methodId === 'fingertip_ppg' &&
+      live?.camera?.needsAlternateLight &&
+      !altDismissed &&
+      !showAltLight
+    ) {
+      setShowAltLight(true);
+    }
+  }, [phase, methodId, live?.camera?.needsAlternateLight, altDismissed, showAltLight]);
+
   const start = async () => {
     setError(null);
     setPhase('running');
     setLive(null);
+    setShowAltLight(false);
+    setAltDismissed(false);
     const ac = new AbortController();
     abortRef.current = ac;
     try {
@@ -67,26 +86,10 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
       <Disclaimer compact />
 
       {phase === 'setup' && (
-        <section className="card">
+        <section className="card card--visual-setup">
           <p className="cta-kicker">Setup</p>
           <h2>{meta.setupTitle}</h2>
-          <ol className="setup-steps">
-            {meta.setupSteps.map((s) => (
-              <li key={s}>{s}</li>
-            ))}
-          </ol>
-          <div className="callout callout--soft">
-            <strong>What good signal looks like</strong>
-            <p>{meta.goodSignalLooksLike}</p>
-          </div>
-          {meta.leastPrecise && (
-            <p className="warn-text">This is the least precise method.</p>
-          )}
-          {methodId === 'fingertip_ppg' && (
-            <p className="hint-text">
-              Flashlight must be turned on manually. This app never controls the torch.
-            </p>
-          )}
+          <VisualGuide methodId={methodId} leastPrecise={meta.leastPrecise} />
           {error && <p className="warn-text">{error}</p>}
           <button type="button" className="btn btn--primary" onClick={() => void start()}>
             Start — ~{meta.durationSec}s
@@ -96,7 +99,21 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
 
       {phase === 'running' && (
         <section className={`card card--live${isCamera ? ' card--camera' : ''}`}>
-          {live?.camera && (
+          {showAltLight && methodId === 'fingertip_ppg' && (
+            <div className="alt-light-overlay">
+              <VisualGuide
+                methodId="fingertip_ppg"
+                compact
+                alternateLightOnly
+                onDismissAlternate={() => {
+                  setShowAltLight(false);
+                  setAltDismissed(true);
+                }}
+              />
+            </div>
+          )}
+
+          {live?.camera && !showAltLight && (
             <CameraGuide
               guide={live.camera}
               status={live.status}
@@ -104,8 +121,11 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
             />
           )}
 
-          {!live?.camera && (
-            <p className="live-status">{live?.status ?? 'Starting…'}</p>
+          {!live?.camera && !showAltLight && (
+            <div className="live-visual-cue">
+              <PlacementCue methodId={methodId} />
+              <p className="live-status">{live?.status ?? 'Starting…'}</p>
+            </div>
           )}
 
           <div className="live-meta">
@@ -120,6 +140,19 @@ export function Measure({ methodId, onDone, onCancel }: Props) {
 
           <SignalWaveform samples={live?.waveform ?? []} height={72} />
           <QualityMeter quality={live?.quality ?? 0} />
+
+          {methodId === 'fingertip_ppg' &&
+            live?.camera?.needsAlternateLight &&
+            altDismissed &&
+            !showAltLight && (
+              <button
+                type="button"
+                className="btn btn--secondary btn--block"
+                onClick={() => setShowAltLight(true)}
+              >
+                Show alternate light guide
+              </button>
+            )}
 
           <button type="button" className="btn btn--ghost btn--block" onClick={cancel}>
             Cancel

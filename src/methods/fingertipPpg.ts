@@ -40,6 +40,8 @@ export async function runFingertipPpg(
   let raf = 0;
   let settled = false;
   let goodContactFrames = 0;
+  let darkFrames = 0;
+  let brightOkFrames = 0;
 
   const rawSamples: number[] = [];
   const timestamps: number[] = []; // performance.now() ms
@@ -113,15 +115,16 @@ export async function runFingertipPpg(
           const meanLuma = (meanR + meanG + meanB) / 3;
 
           const redDominance = meanR / (meanG + meanB + 1);
-          // Strong good-contact gating
-          const brightnessOk = meanR > 90 && meanR < 250;
-          const redOk = redDominance > 1.25;
+          // Stronger good-contact / light gating before publishing BPM
+          const brightnessOk = meanR > 100 && meanR < 245;
+          const redOk = redDominance > 1.35;
           const coverageOk = brightnessOk && redOk;
+          const tooDark = meanLuma < 28 && meanR < 45;
 
           recentMeanR.push(meanR);
-          if (recentMeanR.length > 40) recentMeanR.shift();
+          if (recentMeanR.length > 45) recentMeanR.shift();
           const motionVar = recentVariance(recentMeanR);
-          const motionOk = motionVar < 700;
+          const motionOk = motionVar < 550;
 
           // Update Fs estimate periodically and retune filter coefficients
           timestamps.push(now);
@@ -152,12 +155,15 @@ export async function runFingertipPpg(
           let cueLevel: CameraCueLevel = 'bad';
           let status = 'Cover the lens completely';
 
-          if (meanLuma < 25 && meanR < 40) {
-            status = 'Too dark / turn flashlight on';
+          if (tooDark) {
+            status = 'Too dark — try flashlight or another phone light';
             cueLevel = 'bad';
             goodContactFrames = 0;
+            darkFrames++;
+            brightOkFrames = 0;
           } else if (!coverageOk) {
-            if (meanR < 60 || redDominance < 0.95) {
+            darkFrames = Math.max(0, darkFrames - 2);
+            if (meanR < 70 || redDominance < 1.0) {
               status = 'Cover the lens completely';
             } else if (!redOk) {
               status = 'Press gently — need more red glow';
@@ -166,20 +172,29 @@ export async function runFingertipPpg(
             }
             cueLevel = 'bad';
             goodContactFrames = 0;
+            brightOkFrames = 0;
           } else if (!motionOk) {
+            darkFrames = 0;
             status = 'Hold still';
             cueLevel = 'warn';
             goodContactFrames = Math.max(0, goodContactFrames - 1);
+            brightOkFrames++;
           } else {
+            darkFrames = 0;
             goodContactFrames++;
+            brightOkFrames++;
             status = 'Hold still';
             cueLevel = 'warn';
           }
 
-          const goodContact = coverageOk && motionOk && goodContactFrames > 8;
+          // Require sustained contact (~0.5s+) before treating as good
+          const goodContact = coverageOk && motionOk && goodContactFrames > 14;
+          // Alternate-light prompt after ~1.5s sustained darkness
+          const needsAlternateLight = darkFrames > 45 && brightOkFrames < 10;
           const fs = filterFs;
 
-          if (rawSamples.length > fs * 5 && goodContact) {
+          // Also wait for settle: don't estimate until ~4s of samples under contact
+          if (rawSamples.length > fs * 6 && goodContact && elapsed > 3.5) {
             const windowSec = Math.min(14, Math.max(8, elapsed - 1));
             const nWin = Math.min(rawSamples.length, Math.round(fs * windowSec));
             const sliceTs = timestamps.slice(-nWin);
@@ -204,24 +219,24 @@ export async function runFingertipPpg(
             );
 
             // Gate: do not publish low-SNR / discordant estimates
-            if (est.bpm != null && est.confidence >= 0.28 && !est.discordant) {
-              const stable = tracker.push(est.bpm, 0.28, est.confidence);
+            if (est.bpm != null && est.confidence >= 0.32 && !est.discordant) {
+              const stable = tracker.push(est.bpm, 0.32, est.confidence);
               bpmLive = stable ?? est.bpm;
               quality = est.quality;
-              if (est.confidence >= 0.5) {
+              if (est.confidence >= 0.55) {
                 lockedBpm = bpmLive;
                 settled = true;
                 status = 'Good signal';
                 cueLevel = 'good';
               }
-            } else if (est.bpm != null && est.confidence >= 0.2) {
-              quality = est.quality * 0.7;
+            } else if (est.bpm != null && est.confidence >= 0.24) {
+              quality = est.quality * 0.65;
               // Prefer no live reading over wrong reading when discordant
-              bpmLive = est.discordant ? null : est.bpm;
+              bpmLive = null; // withhold weak / discordant live BPM
               status = est.discordant ? 'Stabilizing… hold still' : 'Hold still';
               cueLevel = 'warn';
             } else {
-              quality = est.quality * 0.5;
+              quality = est.quality * 0.45;
             }
           } else if (!goodContact) {
             quality = 0.12;
@@ -241,6 +256,7 @@ export async function runFingertipPpg(
               cueLevel,
               meanRed: meanR,
               redDominance,
+              needsAlternateLight,
             },
           });
         }
@@ -260,8 +276,8 @@ export async function runFingertipPpg(
   const durationSec = (performance.now() - started) / 1000;
   const fsFinal = robustSampleRate(timestamps, 'ms') || filterFs;
 
-  // Prefer longer analysis window at rest for accuracy near ~90 BPM
-  const dropSec = 1.5;
+  // Discard settle / contact-establishment seconds for cleaner HR
+  const dropSec = 3.0;
   const drop = Math.min(rawSamples.length, Math.round(fsFinal * dropSec));
   const usableRaw = rawSamples.slice(drop);
   const usableTs = timestamps.slice(drop);
@@ -307,7 +323,7 @@ export async function runFingertipPpg(
     confidence *= 0.6;
     notes = 'Autocorr/spectral disagreement — reduced confidence';
   }
-  if (confidence < 0.22 || (est.snrDb < 4 && est.peakCount < 5)) {
+  if (confidence < 0.26 || (est.snrDb < 4.5 && est.peakCount < 5) || est.discordant && confidence < 0.4) {
     notes = (notes ? notes + '; ' : '') + 'Signal too weak for reliable reading';
     bpm = null;
     confidence = 0;

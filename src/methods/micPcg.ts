@@ -200,7 +200,11 @@ function analyzePcg(
   snrDb: number;
   notes?: string;
 } {
-  if (pcm.length < sampleRate * 3) {
+  // Discard settle / placement seconds
+  const settleN = Math.round(sampleRate * 2.5);
+  const usable = pcm.length > settleN ? pcm.subarray(settleN) : pcm;
+
+  if (usable.length < sampleRate * 3) {
     return {
       bpm: null,
       quality: 0.05,
@@ -213,7 +217,7 @@ function analyzePcg(
 
   // Tighter heart-sound band; downsample for efficiency
   const targetFs = Math.min(sampleRate, 1000);
-  const { data: ds, fs } = downsample(pcm, sampleRate, targetFs);
+  const { data: ds, fs } = downsample(usable, sampleRate, targetFs);
   const cleaned = maskNoisySegments(ds, fs, 0.4);
   const bp = filtfiltBandpass(cleaned, 25, 150, fs);
 

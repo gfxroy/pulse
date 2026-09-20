@@ -4,6 +4,8 @@ import { SignalWaveform } from '../components/SignalWaveform';
 import { QualityMeter } from '../components/QualityMeter';
 import { BpmDisplay } from '../components/BpmDisplay';
 import { CameraGuide } from '../components/CameraGuide';
+import { VisualGuide } from '../components/VisualGuide';
+import { PlacementCue } from '../components/PlacementCue';
 import { availableMethods, METHOD_META, runMethod } from '../methods';
 import { fuseResults, methodLabel } from '../fusion/fuse';
 import type {
@@ -32,6 +34,8 @@ export function Composite({ caps, onDone, onCancel }: Props) {
   const [live, setLive] = useState<LiveMeasurement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [fused, setFused] = useState<CompositeResult | null>(null);
+  const [showAltLight, setShowAltLight] = useState(false);
+  const [altDismissed, setAltDismissed] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const current = queue[index];
@@ -41,15 +45,31 @@ export function Composite({ caps, onDone, onCancel }: Props) {
     return () => abortRef.current?.abort();
   }, []);
 
+  useEffect(() => {
+    if (
+      phase === 'running' &&
+      current?.id === 'fingertip_ppg' &&
+      live?.camera?.needsAlternateLight &&
+      !altDismissed &&
+      !showAltLight
+    ) {
+      setShowAltLight(true);
+    }
+  }, [phase, current?.id, live?.camera?.needsAlternateLight, altDismissed, showAltLight]);
+
   const beginMethod = () => {
     setPhase('setup');
     setError(null);
     setLive(null);
+    setShowAltLight(false);
+    setAltDismissed(false);
   };
 
   const startCurrent = async () => {
     if (!current) return;
     setPhase('running');
+    setShowAltLight(false);
+    setAltDismissed(false);
     const ac = new AbortController();
     abortRef.current = ac;
     try {
@@ -60,6 +80,8 @@ export function Composite({ caps, onDone, onCancel }: Props) {
         setIndex(index + 1);
         setPhase('setup');
         setLive(null);
+        setShowAltLight(false);
+        setAltDismissed(false);
       } else {
         const fusedResult = fuseResults(nextResults, 'composite');
         setFused(fusedResult);
@@ -78,6 +100,8 @@ export function Composite({ caps, onDone, onCancel }: Props) {
       setPhase('setup');
       setLive(null);
       setError(null);
+      setShowAltLight(false);
+      setAltDismissed(false);
     } else {
       const fusedResult = fuseResults(results, 'composite');
       setFused(fusedResult);
@@ -127,7 +151,11 @@ export function Composite({ caps, onDone, onCancel }: Props) {
       )}
 
       {(phase === 'setup' || phase === 'running') && current && (
-        <section className={`card${phase === 'running' && isCamera ? ' card--camera' : ''}`}>
+        <section
+          className={`card${phase === 'running' && isCamera ? ' card--camera' : ''}${
+            phase === 'setup' ? ' card--visual-setup' : ''
+          }`}
+        >
           <div className="step-indicator">
             Method {index + 1} of {queue.length}
           </div>
@@ -135,20 +163,7 @@ export function Composite({ caps, onDone, onCancel }: Props) {
 
           {phase === 'setup' && (
             <>
-              <ol className="setup-steps">
-                {current.setupSteps.map((s) => (
-                  <li key={s}>{s}</li>
-                ))}
-              </ol>
-              <div className="callout callout--soft">
-                <strong>What good signal looks like</strong>
-                <p>{current.goodSignalLooksLike}</p>
-              </div>
-              {current.id === 'fingertip_ppg' && (
-                <p className="hint-text">
-                  Turn flashlight on manually. Torch API is never used.
-                </p>
-              )}
+              <VisualGuide methodId={current.id} leastPrecise={current.leastPrecise} />
               {error && <p className="warn-text">{error}</p>}
               <div className="btn-row">
                 <button type="button" className="btn btn--primary" onClick={() => void startCurrent()}>
@@ -163,15 +178,32 @@ export function Composite({ caps, onDone, onCancel }: Props) {
 
           {phase === 'running' && (
             <>
-              {live?.camera && (
+              {showAltLight && current.id === 'fingertip_ppg' && (
+                <div className="alt-light-overlay">
+                  <VisualGuide
+                    methodId="fingertip_ppg"
+                    compact
+                    alternateLightOnly
+                    onDismissAlternate={() => {
+                      setShowAltLight(false);
+                      setAltDismissed(true);
+                    }}
+                  />
+                </div>
+              )}
+
+              {live?.camera && !showAltLight && (
                 <CameraGuide
                   guide={live.camera}
                   status={live.status}
                   showFlashHint={current.id === 'fingertip_ppg'}
                 />
               )}
-              {!live?.camera && (
-                <p className="live-status">{live?.status ?? 'Starting…'}</p>
+              {!live?.camera && !showAltLight && (
+                <div className="live-visual-cue">
+                  <PlacementCue methodId={current.id} />
+                  <p className="live-status">{live?.status ?? 'Starting…'}</p>
+                </div>
               )}
               <div className="live-meta">
                 <div className="progress-chip">
@@ -184,6 +216,18 @@ export function Composite({ caps, onDone, onCancel }: Props) {
               </div>
               <SignalWaveform samples={live?.waveform ?? []} height={72} />
               <QualityMeter quality={live?.quality ?? 0} />
+              {current.id === 'fingertip_ppg' &&
+                live?.camera?.needsAlternateLight &&
+                altDismissed &&
+                !showAltLight && (
+                  <button
+                    type="button"
+                    className="btn btn--secondary btn--block"
+                    onClick={() => setShowAltLight(true)}
+                  >
+                    Show alternate light guide
+                  </button>
+                )}
             </>
           )}
         </section>

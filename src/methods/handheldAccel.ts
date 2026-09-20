@@ -150,7 +150,9 @@ function analyze(
   peakCount: number;
   snrDb: number;
 } {
-  const x = resample(samples, FS);
+  let x = resample(samples, FS);
+  const settle = Math.round(FS * 3);
+  if (x.length > settle) x = x.subarray(settle);
   if (x.length < FS * 10) {
     return { bpm: null, quality: 0.05, confidence: 0, peakCount: 0, snrDb: 0 };
   }
