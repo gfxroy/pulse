@@ -51,13 +51,14 @@ export function CameraGuide({ guide, status, showFlashHint }: Props) {
         ) : (
           <FaceOverlay guide={guide} />
         )}
+
+        <div className="camera-guide__status" role="status">
+          {status}
+        </div>
       </div>
       {showFlashHint && guide.mode === 'fingertip' && guide.cueLevel === 'bad' && (
         <p className="camera-guide__flash">Turn flashlight on manually</p>
       )}
-      <span className="sr-only" role="status">
-        {status}
-      </span>
     </div>
   );
 }

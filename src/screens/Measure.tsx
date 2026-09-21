@@ -144,7 +144,7 @@ export function Measure({ methodId, onDone, onCancel, onBeat }: Props) {
             </div>
           )}
 
-          {live && (
+          {live && !live.camera && !showAltLight && (
             <div className="status-chip">{live.status}</div>
           )}
 
