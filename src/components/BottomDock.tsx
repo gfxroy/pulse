@@ -1,11 +1,22 @@
 import type { MethodId } from '../types';
 
-const ICONS: { id: MethodId; file: string; tilt: number }[] = [
-  { id: 'handheld_accel', file: 'icon-ll.png', tilt: -16 },
-  { id: 'mic_pcg', file: 'icon-l.png', tilt: -8 },
-  { id: 'fingertip_ppg', file: 'icon-center.png', tilt: 0 },
-  { id: 'chest_motion', file: 'icon-r.png', tilt: 8 },
-  { id: 'facial_rppg', file: 'icon-rr.png', tilt: 16 },
+/**
+ * Dock icon crops from Figma sprite bd2746… / icons-sprite.png
+ * imageTransform → background-size / background-position (STRETCH).
+ * Visual order L→R matches home/setup frames: hand, mic, camera, phone, face.
+ */
+const ICONS: {
+  id: MethodId;
+  crop: string;
+  tilt: number;
+  rise: number;
+  hero?: boolean;
+}[] = [
+  { id: 'handheld_accel', crop: 'hand', tilt: -16, rise: 18 },
+  { id: 'mic_pcg', crop: 'mic', tilt: -8, rise: 10 },
+  { id: 'fingertip_ppg', crop: 'cam', tilt: 0, rise: 0, hero: true },
+  { id: 'chest_motion', crop: 'phone', tilt: 8, rise: 10 },
+  { id: 'facial_rppg', crop: 'face', tilt: 16, rise: 18 },
 ];
 
 interface Props {
@@ -29,17 +40,19 @@ export function BottomDock({ title, subtitle, duration, legal, selected, onSelec
             <button
               key={icon.id}
               type="button"
-              className={`dock__icon${icon.id === 'fingertip_ppg' ? ' dock__icon--hero' : ''}${on ? ' is-on' : ''}`}
-              style={{ transform: `rotate(${icon.tilt}deg)` }}
+              className={`dock__icon${icon.hero ? ' dock__icon--hero' : ''}${on ? ' is-on' : ''}`}
+              style={{
+                transform: `rotate(${icon.tilt}deg)`,
+                marginTop: icon.rise,
+              }}
               onClick={() => onSelect?.(icon.id)}
               aria-label={icon.id.replace(/_/g, ' ')}
+              aria-pressed={on || undefined}
             >
-              <img
-                src={`${base}figma/${icon.file}`}
-                alt=""
-                draggable={false}
-                width={188}
-                height={185}
+              <span
+                className={`dock__sprite dock__sprite--${icon.crop}`}
+                style={{ backgroundImage: `url(${base}figma/icons-sprite.png)` }}
+                aria-hidden
               />
             </button>
           );
