@@ -88,7 +88,7 @@ export function VisualGuide({
                 setIndex(i);
                 setUseAlt(false);
               }}
-              aria-label={`Step ${i + 1}`}
+              aria-label={`Step ${i + 1} of ${steps.length}`}
             />
           ))}
         </div>
@@ -99,13 +99,9 @@ export function VisualGuide({
           onClick={() => go(1)}
           aria-label="Next step"
         >
-          →
+          Next →
         </button>
       </div>
-
-      <p className="visual-guide__step-count">
-        {index + 1} / {steps.length}
-      </p>
 
       {alternateLightOnly && onDismissAlternate && (
         <button type="button" className="btn btn--secondary" onClick={onDismissAlternate}>

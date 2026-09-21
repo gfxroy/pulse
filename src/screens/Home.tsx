@@ -64,7 +64,7 @@ export function Home({ caps, onQuick, onComposite, onHistory, historyCount }: Pr
       </section>
 
       <p className="section-label">Available methods</p>
-      <section className="card" style={{ marginTop: '0.35rem' }}>
+      <section className="card card--methods">
         <div className="method-list">
           {methods.length === 0 && (
             <p className="warn-text">

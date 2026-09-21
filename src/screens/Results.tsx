@@ -45,9 +45,9 @@ export function Results({ latest, history, onBack, onHistoryChange }: Props) {
       )}
 
       <p className="section-label">History</p>
-      <section className="card" style={{ marginTop: '0.35rem' }}>
+      <section className="card card--history">
         <div className="card__row">
-          <h2 style={{ fontSize: '1.15rem' }}>Past readings</h2>
+          <h2 className="card__subhead">Past readings</h2>
           {history.length > 0 && (
             <button
               type="button"
