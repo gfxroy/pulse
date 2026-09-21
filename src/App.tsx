@@ -4,6 +4,7 @@ import { Home } from './screens/Home';
 import { Measure } from './screens/Measure';
 import { Composite } from './screens/Composite';
 import { Results } from './screens/Results';
+import { PulseGlow } from './components/PulseGlow';
 import { probeCapabilities } from './capabilities/probe';
 import { fuseResults } from './fusion/fuse';
 import { loadHistory, saveHistoryEntry } from './storage/history';
@@ -25,6 +26,13 @@ export default function App() {
   const [measureMethod, setMeasureMethod] = useState<MethodId | null>(null);
   const [latest, setLatest] = useState<CompositeResult | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [beatBpm, setBeatBpm] = useState<number | null>(null);
+  const [beating, setBeating] = useState(false);
+
+  const onBeat = useCallback((bpm: number | null, active: boolean) => {
+    setBeatBpm(bpm);
+    setBeating(active);
+  }, []);
 
   useEffect(() => {
     setHistory(loadHistory());
@@ -45,12 +53,16 @@ export default function App() {
     setHistory(loadHistory());
   }, []);
 
-  const persist = useCallback((result: CompositeResult) => {
-    setLatest(result);
-    saveHistoryEntry(result);
-    refreshHistory();
-    setScreen('results');
-  }, [refreshHistory]);
+  const persist = useCallback(
+    (result: CompositeResult) => {
+      setLatest(result);
+      saveHistoryEntry(result);
+      refreshHistory();
+      setBeating(false);
+      setScreen('home');
+    },
+    [refreshHistory],
+  );
 
   const onOnboardingComplete = (motionGranted: boolean) => {
     localStorage.setItem(ONBOARD_KEY, '1');
@@ -65,71 +77,51 @@ export default function App() {
     setScreen('home');
   };
 
-  const onQuick = (methodId: MethodId) => {
-    setMeasureMethod(methodId);
-    setScreen('measure');
+  const goHome = () => {
+    onBeat(null, false);
+    setScreen('home');
   };
 
-  const onMeasureDone = (result: MethodResult) => {
-    persist(fuseResults([result], 'single'));
-  };
-
-  if (screen === 'onboarding') {
-    return (
-      <Onboarding
-        caps={caps}
-        probing={probing}
-        onComplete={onOnboardingComplete}
-      />
-    );
-  }
-
-  if (!caps) {
-    return (
-      <div className="screen">
-        <p className="muted">Loading capabilities…</p>
+  const body =
+    screen === 'onboarding' ? (
+      <Onboarding caps={caps} probing={probing} onComplete={onOnboardingComplete} />
+    ) : !caps ? (
+      <div className="screen screen--figma">
+        <p className="home-checked">Loading…</p>
       </div>
-    );
-  }
-
-  if (screen === 'measure' && measureMethod) {
-    return (
+    ) : screen === 'measure' && measureMethod ? (
       <Measure
         methodId={measureMethod}
-        onDone={onMeasureDone}
-        onCancel={() => setScreen('home')}
+        onDone={(result: MethodResult) => persist(fuseResults([result], 'single'))}
+        onCancel={goHome}
+        onBeat={onBeat}
       />
-    );
-  }
-
-  if (screen === 'composite') {
-    return (
-      <Composite
-        caps={caps}
-        onDone={persist}
-        onCancel={() => setScreen('home')}
-      />
-    );
-  }
-
-  if (screen === 'results') {
-    return (
+    ) : screen === 'composite' ? (
+      <Composite caps={caps} onDone={persist} onCancel={goHome} />
+    ) : screen === 'results' ? (
       <Results
         latest={latest}
         history={history}
-        onBack={() => setScreen('home')}
+        onBack={goHome}
         onHistoryChange={refreshHistory}
       />
+    ) : (
+      <Home
+        caps={caps}
+        onQuick={(id) => {
+          setMeasureMethod(id);
+          setScreen('measure');
+        }}
+        onComposite={() => setScreen('composite')}
+        onHistory={() => setScreen('results')}
+        history={history}
+      />
     );
-  }
 
   return (
-    <Home
-      caps={caps}
-      onQuick={onQuick}
-      onComposite={() => setScreen('composite')}
-      onHistory={() => setScreen('results')}
-      historyCount={history.length}
-    />
+    <>
+      <PulseGlow bpm={beatBpm} active={beating} />
+      {body}
+    </>
   );
 }

@@ -9,11 +9,8 @@ import type { MethodId } from '../types';
 
 interface Props {
   methodId: MethodId;
-  /** Show least-precise badge for handheld. */
   leastPrecise?: boolean;
-  /** Compact mode for overlays during measure. */
   compact?: boolean;
-  /** Force alternate-light PPG flow (dark prompt). */
   alternateLightOnly?: boolean;
   onDismissAlternate?: () => void;
 }
@@ -43,15 +40,33 @@ export function VisualGuide({
 
   return (
     <div className={`visual-guide${compact ? ' visual-guide--compact' : ''}`}>
-      {leastPrecise && (
-        <span className="visual-guide__badge">Least precise</span>
-      )}
+      {leastPrecise && <span className="visual-guide__badge">Least precise</span>}
       {alternateLightOnly && (
         <p className="visual-guide__banner">Too dark — try alternate light</p>
       )}
 
-      <div className="visual-guide__stage" aria-live="polite">
-        <GuideArt art={art} className="visual-guide__art" />
+      <div className="guide-carousel">
+        <button
+          type="button"
+          className="guide-arrow"
+          disabled={index === 0}
+          onClick={() => go(-1)}
+          aria-label="Previous step"
+        >
+          ←
+        </button>
+        <div className="guide-frame" aria-live="polite">
+          <GuideArt art={art} className="guide-frame__img" />
+        </div>
+        <button
+          type="button"
+          className="guide-arrow"
+          disabled={index >= steps.length - 1}
+          onClick={() => go(1)}
+          aria-label="Next step"
+        >
+          →
+        </button>
       </div>
 
       <p className="visual-guide__caption">{caption}</p>
@@ -66,46 +81,26 @@ export function VisualGuide({
         </button>
       )}
 
-      <div className="visual-guide__nav">
-        <button
-          type="button"
-          className="btn btn--ghost visual-guide__nav-btn"
-          disabled={index === 0}
-          onClick={() => go(-1)}
-          aria-label="Previous step"
-        >
-          ←
-        </button>
-        <div className="visual-guide__dots" role="tablist" aria-label="Guide steps">
-          {steps.map((s, i) => (
-            <button
-              key={s.id}
-              type="button"
-              role="tab"
-              aria-selected={i === index}
-              className={`visual-guide__dot${i === index ? ' is-active' : ''}`}
-              onClick={() => {
-                setIndex(i);
-                setUseAlt(false);
-              }}
-              aria-label={`Step ${i + 1} of ${steps.length}`}
-            />
-          ))}
-        </div>
-        <button
-          type="button"
-          className="btn btn--ghost visual-guide__nav-btn"
-          disabled={index >= steps.length - 1}
-          onClick={() => go(1)}
-          aria-label="Next step"
-        >
-          Next →
-        </button>
+      <div className="guide-dots" role="tablist" aria-label="Guide steps">
+        {steps.map((s, i) => (
+          <button
+            key={s.id}
+            type="button"
+            role="tab"
+            aria-selected={i === index}
+            className={`guide-dot${i === index ? ' is-active' : ''}`}
+            onClick={() => {
+              setIndex(i);
+              setUseAlt(false);
+            }}
+            aria-label={`Step ${i + 1} of ${steps.length}`}
+          />
+        ))}
       </div>
 
       {alternateLightOnly && onDismissAlternate && (
-        <button type="button" className="btn btn--secondary" onClick={onDismissAlternate}>
-          Got it — resume
+        <button type="button" className="pill pill--quick" onClick={onDismissAlternate}>
+          <span className="pill__title">Got it — resume</span>
         </button>
       )}
     </div>

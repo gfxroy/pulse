@@ -4,13 +4,9 @@ import type { CameraGuideLive } from '../types';
 interface Props {
   guide: CameraGuideLive;
   status: string;
-  /** Keep flashlight reminder visible for fingertip. */
   showFlashHint?: boolean;
 }
 
-/**
- * Live camera UI: preview + overlay guides + one status line.
- */
 export function CameraGuide({ guide, status, showFlashHint }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -20,14 +16,11 @@ export function CameraGuide({ guide, status, showFlashHint }: Props) {
     if (video.srcObject !== guide.stream) {
       video.srcObject = guide.stream;
       void video.play().catch(() => {
-        /* autoplay may fail briefly; stream still attaches */
+        /* autoplay may fail briefly */
       });
     }
     return () => {
-      // Don't stop tracks here — the method owns the stream lifecycle.
-      if (video.srcObject === guide.stream) {
-        video.srcObject = null;
-      }
+      if (video.srcObject === guide.stream) video.srcObject = null;
     };
   }, [guide.stream]);
 
@@ -48,26 +41,23 @@ export function CameraGuide({ guide, status, showFlashHint }: Props) {
           muted
           autoPlay
         />
-        <div className="camera-guide__veil" aria-hidden />
+        <p className="capture-feed-label">camera feed</p>
 
         {guide.mode === 'fingertip' ? (
           <div className="camera-guide__finger-target" aria-hidden>
             <div className="camera-guide__finger-ring" />
-            <span className="camera-guide__finger-label">Cover lens</span>
+            <span className="camera-guide__finger-label">Cover Lens</span>
           </div>
         ) : (
           <FaceOverlay guide={guide} />
         )}
-
-        <div className="camera-guide__hud">
-          <p className="camera-guide__status" role="status" aria-live="polite">
-            {status}
-          </p>
-          {showFlashHint && guide.mode === 'fingertip' && (
-            <p className="camera-guide__flash">Flashlight ON manually — app never controls torch</p>
-          )}
-        </div>
       </div>
+      {showFlashHint && guide.mode === 'fingertip' && guide.cueLevel === 'bad' && (
+        <p className="camera-guide__flash">Turn flashlight on manually</p>
+      )}
+      <span className="sr-only" role="status">
+        {status}
+      </span>
     </div>
   );
 }
@@ -80,20 +70,13 @@ function FaceOverlay({ guide }: { guide: CameraGuideLive }) {
     width: `${roi.w * 100}%`,
     height: `${roi.h * 100}%`,
   };
-
   return (
     <div
       className={`camera-guide__face-roi${guide.roiLocked ? ' camera-guide__face-roi--locked' : ''}`}
       style={style}
       aria-hidden
     >
-      <span className="camera-guide__corner camera-guide__corner--tl" />
-      <span className="camera-guide__corner camera-guide__corner--tr" />
-      <span className="camera-guide__corner camera-guide__corner--bl" />
-      <span className="camera-guide__corner camera-guide__corner--br" />
-      {!guide.roiLocked && (
-        <span className="camera-guide__face-hint">Forehead / cheeks</span>
-      )}
+      <span className="camera-guide__face-hint">Forehead / cheeks</span>
     </div>
   );
 }

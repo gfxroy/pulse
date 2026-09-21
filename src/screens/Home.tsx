@@ -1,81 +1,90 @@
-import { Disclaimer } from '../components/Disclaimer';
-import { MethodCard } from '../components/MethodCard';
+import { BrandMark } from '../components/BrandMark';
+import { BottomDock } from '../components/BottomDock';
 import { availableMethods, bestMethod } from '../methods';
-import type { Capabilities, MethodId } from '../types';
+import type { Capabilities, HistoryEntry, MethodId } from '../types';
 
 interface Props {
   caps: Capabilities;
   onQuick: (methodId: MethodId) => void;
   onComposite: () => void;
   onHistory: () => void;
-  historyCount: number;
+  history: HistoryEntry[];
 }
 
-export function Home({ caps, onQuick, onComposite, onHistory, historyCount }: Props) {
+function formatLastChecked(ts: number): string {
+  const d = new Date(ts);
+  const day = d.getDate();
+  const mon = d.toLocaleString('en-US', { month: 'short' }).toLowerCase();
+  let h = d.getHours();
+  const min = String(d.getMinutes()).padStart(2, '0');
+  const ap = h >= 12 ? 'Pm' : 'Am';
+  h = h % 12 || 12;
+  return `last checked at ${day} ${mon} ${h}:${min} ${ap}`;
+}
+
+export function Home({ caps, onQuick, onComposite, onHistory, history }: Props) {
   const methods = availableMethods(caps);
   const best = bestMethod(caps);
   const canComposite = methods.length >= 2;
+  const latest = history.find((h) => h.result.bpm != null) ?? history[0];
+  const bpm = latest?.result.bpm != null ? Math.round(latest.result.bpm) : null;
 
   return (
-    <div className="screen screen--home">
-      <header className="topbar">
-        <h1>Pulse Wellness</h1>
-        <button type="button" className="btn btn--ghost" onClick={onHistory}>
-          History{historyCount > 0 ? ` (${historyCount})` : ''}
+    <div className="screen screen--figma screen--home">
+      <header className="chrome">
+        <span className="chrome__side" />
+        <BrandMark />
+        <button type="button" className="chrome__hist" onClick={onHistory}>
+          ···
         </button>
       </header>
 
-      <Disclaimer compact />
+      <div className="home-hero-bpm">
+        {latest && (
+          <p className="home-checked">{formatLastChecked(latest.result.timestamp)}</p>
+        )}
+        <div className="home-readout">
+          <img
+            className="home-heart"
+            src={`${import.meta.env.BASE_URL}figma/heart-clean.png`}
+            alt=""
+            width={291}
+            height={291}
+            draggable={false}
+          />
+          <div className="home-readout__num">
+            <span className="home-bpm">{bpm ?? '—'}</span>
+            <span className="home-bpm-unit">BPM</span>
+          </div>
+        </div>
+      </div>
 
-      <section className="card card--highlight">
-        <p className="cta-kicker">Recommended</p>
-        <h2>Quick check</h2>
-        <p className="muted">
-          Single best available method
-          {best ? `: ${best.name}` : ' — none available on this device'}.
-        </p>
+      <div className="home-actions">
         <button
           type="button"
-          className="btn btn--primary"
+          className="pill pill--quick"
           disabled={!best}
           onClick={() => best && onQuick(best.id)}
         >
-          Start quick check
+          <span className="pill__title">Quick Check</span>
+          <span className="pill__hint">Single best available method</span>
         </button>
-      </section>
-
-      <section className="card">
-        <p className="cta-kicker">Multi-sensor</p>
-        <h2>Guided scan</h2>
-        <p className="muted">
-          Run each available method in sequence, then fuse with confidence weighting.
-          {canComposite
-            ? ` ${methods.length} methods ready.`
-            : ' Needs at least 2 available methods.'}
-        </p>
         <button
           type="button"
-          className="btn btn--secondary"
+          className="pill pill--guided"
           disabled={!canComposite}
           onClick={onComposite}
         >
-          Start guided scan
+          <span className="pill__title">Guided Scan</span>
+          <span className="pill__hint">avg of all the methods combine</span>
         </button>
-      </section>
+      </div>
 
-      <p className="section-label">Available methods</p>
-      <section className="card card--methods">
-        <div className="method-list">
-          {methods.length === 0 && (
-            <p className="warn-text">
-              No sensors available. Use a phone browser over HTTPS and allow permissions.
-            </p>
-          )}
-          {methods.map((m) => (
-            <MethodCard key={m.id} meta={m} onSelect={() => onQuick(m.id)} />
-          ))}
-        </div>
-      </section>
+      <BottomDock
+        title="HOME"
+        onSelect={(id) => methods.some((m) => m.id === id) && onQuick(id)}
+        legal="Wellness estimate only not a medical device. Not for diagnosis or treatment."
+      />
     </div>
   );
 }

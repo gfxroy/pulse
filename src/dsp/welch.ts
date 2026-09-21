@@ -170,10 +170,19 @@ export function spectralPeakHarmonicAware(
   cands.sort((a, b) => b.p - a.p);
   const top = cands.slice(0, Math.min(8, cands.length));
 
-  // Median band power for SNR
+  // Median in-band power excluding the strongest peak neighborhood, so SNR
+  // is peak-vs-noise rather than peak-vs-(peak+noise).
+  const peakF = top[0].f;
   const bandPowers: number[] = [];
   for (let k = 0; k < power.length; k++) {
-    if (freqs[k] >= fMin && freqs[k] <= fMax) bandPowers.push(power[k]);
+    if (freqs[k] < fMin || freqs[k] > fMax) continue;
+    if (Math.abs(freqs[k] - peakF) < 0.12) continue;
+    bandPowers.push(power[k]);
+  }
+  if (bandPowers.length < 4) {
+    for (let k = 0; k < power.length; k++) {
+      if (freqs[k] >= fMin && freqs[k] <= fMax) bandPowers.push(power[k]);
+    }
   }
   bandPowers.sort((a, b) => a - b);
   const medianP = bandPowers[Math.floor(bandPowers.length / 2)] || 1e-24;

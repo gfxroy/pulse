@@ -23,10 +23,9 @@ export function Onboarding({ caps, probing, onComplete }: Props) {
   return (
     <div className="screen screen--onboarding">
       <div className="hero">
-        <span className="hero__eyebrow">Wellness · Multi-sensor</span>
         <span className="hero__mark" aria-hidden />
-        <h1>Pulse Wellness</h1>
-        <p className="hero__tag">A quiet reading of your heart rate from the sensors you already carry.</p>
+        <h1>Pulse</h1>
+        <p className="hero__tag">A quiet reading of your heart rate, from the phone you already have.</p>
       </div>
 
       {step === 0 && (

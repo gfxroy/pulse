@@ -1,25 +1,20 @@
 interface Props {
-  quality: number; // 0–1
+  quality: number;
   label?: string;
 }
 
 export function QualityMeter({ quality, label = 'Signal quality' }: Props) {
   const pct = Math.round(Math.max(0, Math.min(1, quality)) * 100);
-  let tone: 'low' | 'mid' | 'high' = 'low';
-  if (pct >= 65) tone = 'high';
-  else if (pct >= 35) tone = 'mid';
+  const word = pct >= 65 ? 'Good' : pct >= 35 ? 'Hold' : 'Weak';
 
   return (
-    <div className="quality-meter" aria-label={`${label}: ${pct}%`}>
+    <div className="quality-meter" aria-label={`${label}: ${word}`}>
       <div className="quality-meter__header">
         <span>{label}</span>
-        <span className={`quality-meter__pct quality-meter__pct--${tone}`}>{pct}%</span>
+        <span>{word}</span>
       </div>
       <div className="quality-meter__track">
-        <div
-          className={`quality-meter__fill quality-meter__fill--${tone}`}
-          style={{ width: `${pct}%` }}
-        />
+        <div className="quality-meter__fill" style={{ width: `${Math.max(8, pct)}%` }} />
       </div>
     </div>
   );

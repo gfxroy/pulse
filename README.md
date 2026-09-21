@@ -68,7 +68,7 @@ This app **never** attempts programmatic torch/flashlight control. For fingertip
 
 ## Visual setup guides
 
-Each method opens a **step carousel** of SVG illustrations (phone silhouettes, finger/face/chest stickers) with one short caption per step — not walls of text. Live camera target overlays remain during fingertip and face measurement.
+Each method opens a **step carousel** of ink-and-watercolor drawings with one short caption per step — not walls of text. Live camera target overlays remain during fingertip and face measurement.
 
 ## Privacy
 

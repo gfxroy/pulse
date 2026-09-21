@@ -1,8 +1,7 @@
 /**
- * Fingertip PPG via rear camera red-channel mean.
- * Timestamps with performance.now(); Fs derived from timestamps (never assumed 30).
- * Dual estimate: autocorrelation + spectral with harmonic rejection.
- * Manual flashlight only — never torch API.
+ * Fingertip PPG via rear camera.
+ * Unique video frames only (never rAF-duplicated); timestamps → uniform grid;
+ * HR estimated on the longest good-contact run. Manual flashlight only.
  */
 
 import {
@@ -12,14 +11,32 @@ import {
   adaptiveBandHz,
 } from '../dsp/filters';
 import { estimateHeartRateSliding, HrTracker } from '../dsp/hrEstimate';
-import { robustSampleRate, linearDetrend, savitzkyGolay } from '../dsp/preprocess';
+import {
+  robustSampleRate,
+  linearDetrend,
+  savitzkyGolay,
+  resampleUniform,
+  medianFilter3,
+  contiguousRuns,
+} from '../dsp/preprocess';
 import type { CameraCueLevel, MethodResult } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
 
 const DURATION = METHOD_META.fingertip_ppg.durationSec;
-/** Seed filter Fs until enough timestamps accumulate. */
 const FS_SEED = 30;
+
+interface VideoFrameCallbackMeta {
+  mediaTime: number;
+  presentedFrames?: number;
+}
+
+type VideoWithFrameCallback = HTMLVideoElement & {
+  requestVideoFrameCallback?: (
+    cb: (now: number, meta: VideoFrameCallbackMeta) => void,
+  ) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
 
 function recentVariance(arr: number[]): number {
   if (arr.length < 2) return 0;
@@ -27,6 +44,15 @@ function recentVariance(arr: number[]): number {
   let v = 0;
   for (const x of arr) v += (x - mean) ** 2;
   return v / arr.length;
+}
+
+function pulsatility(arr: number[]): number {
+  if (arr.length < 8) return 0;
+  const mean = arr.reduce((a, c) => a + c, 0) / arr.length;
+  if (mean < 8) return 0;
+  let v = 0;
+  for (const x of arr) v += (x - mean) ** 2;
+  return Math.sqrt(v / arr.length) / mean;
 }
 
 export async function runFingertipPpg(
@@ -38,20 +64,28 @@ export async function runFingertipPpg(
   let video: HTMLVideoElement | null = null;
   let canvas: HTMLCanvasElement | null = null;
   let raf = 0;
+  let rvfcHandle = 0;
   let settled = false;
   let goodContactFrames = 0;
   let darkFrames = 0;
   let brightOkFrames = 0;
 
-  const rawSamples: number[] = [];
-  const timestamps: number[] = []; // performance.now() ms
+  const rawR: number[] = [];
+  const rawG: number[] = [];
+  const timestamps: number[] = [];
+  const contact: boolean[] = [];
   let filter = new BandpassFilter(0.7, 3.5, FS_SEED, true);
   let filterFs = FS_SEED;
   const waveformWindow: number[] = [];
   const recentMeanR: number[] = [];
+  const recentR: number[] = [];
+  const recentG: number[] = [];
   const tracker = new HrTracker(7);
   let lockedBpm: number | null = null;
-  let lastFrameTs = 0;
+  let lastMediaTime = -1;
+  let lastCurrentTime = -1;
+  let prevMeanR: number | null = null;
+  let done = false;
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -72,201 +106,257 @@ export async function runFingertipPpg(
 
     canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+    const v = video as VideoWithFrameCallback;
 
     await new Promise<void>((resolve, reject) => {
-      const tick = () => {
+      const finish = (err?: unknown) => {
+        if (done) return;
+        done = true;
+        if (err) reject(err);
+        else resolve();
+      };
+
+      const processFrame = (now: number) => {
+        if (done) return;
         if (signal.aborted) {
-          reject(new DOMException('Aborted', 'AbortError'));
+          finish(new DOMException('Aborted', 'AbortError'));
           return;
         }
-        const now = performance.now();
         const elapsed = (now - started) / 1000;
         if (elapsed >= DURATION) {
-          resolve();
+          finish();
           return;
         }
 
         const vw = video!.videoWidth;
         const vh = video!.videoHeight;
-        if (vw > 0 && vh > 0) {
-          // Deduplicate: skip if camera hasn't produced a new frame recently
-          // but still timestamp every accepted sample with performance.now()
-          const cw = Math.floor(vw * 0.4);
-          const ch = Math.floor(vh * 0.4);
-          const sx = Math.floor((vw - cw) / 2);
-          const sy = Math.floor((vh - ch) / 2);
-          canvas!.width = cw;
-          canvas!.height = ch;
-          ctx.drawImage(video!, sx, sy, cw, ch, 0, 0, cw, ch);
-          const img = ctx.getImageData(0, 0, cw, ch);
-          let sumR = 0;
-          let sumG = 0;
-          let sumB = 0;
-          const data = img.data;
-          const pixels = cw * ch;
-          for (let i = 0; i < data.length; i += 4) {
-            sumR += data[i];
-            sumG += data[i + 1];
-            sumB += data[i + 2];
+        if (vw <= 0 || vh <= 0) return;
+
+        const cw = Math.floor(vw * 0.4);
+        const ch = Math.floor(vh * 0.4);
+        const sx = Math.floor((vw - cw) / 2);
+        const sy = Math.floor((vh - ch) / 2);
+        canvas!.width = cw;
+        canvas!.height = ch;
+        ctx.drawImage(video!, sx, sy, cw, ch, 0, 0, cw, ch);
+        const img = ctx.getImageData(0, 0, cw, ch);
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        const data = img.data;
+        const pixels = cw * ch;
+        for (let i = 0; i < data.length; i += 4) {
+          sumR += data[i];
+          sumG += data[i + 1];
+          sumB += data[i + 2];
+        }
+        let meanR = sumR / pixels;
+        const meanG = sumG / pixels;
+        const meanB = sumB / pixels;
+        const meanLuma = (meanR + meanG + meanB) / 3;
+
+        // Hold across auto-exposure pops (finger cover makes AE hunt).
+        if (prevMeanR != null && Math.abs(meanR - prevMeanR) > 32 && goodContactFrames > 8) {
+          meanR = prevMeanR;
+        }
+        prevMeanR = meanR;
+
+        const redDominance = meanR / (meanG + meanB + 1);
+        const brightnessOk = meanR > 85 && meanR < 248;
+        const redOk = redDominance > 1.2 || meanR > 140;
+        const coverageOk = brightnessOk && redOk;
+        const tooDark = meanLuma < 28 && meanR < 45;
+
+        recentMeanR.push(meanR);
+        if (recentMeanR.length > 45) recentMeanR.shift();
+        recentR.push(meanR);
+        recentG.push(meanG);
+        if (recentR.length > 60) {
+          recentR.shift();
+          recentG.shift();
+        }
+        const motionVar = recentVariance(recentMeanR);
+        const motionOk = motionVar < 550;
+
+        timestamps.push(now);
+        rawR.push(meanR);
+        rawG.push(meanG);
+
+        if (timestamps.length === 40 || (timestamps.length > 40 && timestamps.length % 30 === 0)) {
+          const fsEst = robustSampleRate(timestamps, 'ms');
+          if (fsEst >= 12 && fsEst <= 90 && Math.abs(fsEst - filterFs) > 1.5) {
+            filterFs = fsEst;
+            const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.8);
+            filter = new BandpassFilter(band.low, band.high, filterFs, true);
+            const replay = rawR.slice(-Math.round(filterFs * 2));
+            for (const val of replay) filter.process(val);
+          } else if (lockedBpm != null && timestamps.length % 60 === 0) {
+            const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.8);
+            filter.retune(band.low, band.high, filterFs);
           }
-          const meanR = sumR / pixels;
-          const meanG = sumG / pixels;
-          const meanB = sumB / pixels;
-          const meanLuma = (meanR + meanG + meanB) / 3;
-
-          const redDominance = meanR / (meanG + meanB + 1);
-          // Stronger good-contact / light gating before publishing BPM
-          const brightnessOk = meanR > 100 && meanR < 245;
-          const redOk = redDominance > 1.35;
-          const coverageOk = brightnessOk && redOk;
-          const tooDark = meanLuma < 28 && meanR < 45;
-
-          recentMeanR.push(meanR);
-          if (recentMeanR.length > 45) recentMeanR.shift();
-          const motionVar = recentVariance(recentMeanR);
-          const motionOk = motionVar < 550;
-
-          // Update Fs estimate periodically and retune filter coefficients
-          timestamps.push(now);
-          rawSamples.push(meanR);
-
-          if (timestamps.length === 40 || (timestamps.length > 40 && timestamps.length % 30 === 0)) {
-            const fsEst = robustSampleRate(timestamps, 'ms');
-            if (fsEst >= 12 && fsEst <= 90 && Math.abs(fsEst - filterFs) > 1.5) {
-              filterFs = fsEst;
-              const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.65);
-              filter = new BandpassFilter(band.low, band.high, filterFs, true);
-              // Replay recent raw into new filter to rebuild state
-              const replay = rawSamples.slice(-Math.round(filterFs * 2));
-              for (const v of replay) filter.process(v);
-            } else if (lockedBpm != null && timestamps.length % 60 === 0) {
-              const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.65);
-              filter.retune(band.low, band.high, filterFs);
-            }
-          }
-
-          // Only publish filtered sample when contact is plausible (still collect raw)
-          const filtered = filter.process(meanR);
-          waveformWindow.push(filtered);
-          if (waveformWindow.length > 120) waveformWindow.shift();
-
-          let quality = 0.12;
-          let bpmLive: number | null = null;
-          let cueLevel: CameraCueLevel = 'bad';
-          let status = 'Cover the lens completely';
-
-          if (tooDark) {
-            status = 'Too dark — try flashlight or another phone light';
-            cueLevel = 'bad';
-            goodContactFrames = 0;
-            darkFrames++;
-            brightOkFrames = 0;
-          } else if (!coverageOk) {
-            darkFrames = Math.max(0, darkFrames - 2);
-            if (meanR < 70 || redDominance < 1.0) {
-              status = 'Cover the lens completely';
-            } else if (!redOk) {
-              status = 'Press gently — need more red glow';
-            } else {
-              status = 'Adjust pressure — brightness out of range';
-            }
-            cueLevel = 'bad';
-            goodContactFrames = 0;
-            brightOkFrames = 0;
-          } else if (!motionOk) {
-            darkFrames = 0;
-            status = 'Hold still';
-            cueLevel = 'warn';
-            goodContactFrames = Math.max(0, goodContactFrames - 1);
-            brightOkFrames++;
-          } else {
-            darkFrames = 0;
-            goodContactFrames++;
-            brightOkFrames++;
-            status = 'Hold still';
-            cueLevel = 'warn';
-          }
-
-          // Require sustained contact (~0.5s+) before treating as good
-          const goodContact = coverageOk && motionOk && goodContactFrames > 14;
-          // Alternate-light prompt after ~1.5s sustained darkness
-          const needsAlternateLight = darkFrames > 45 && brightOkFrames < 10;
-          const fs = filterFs;
-
-          // Also wait for settle: don't estimate until ~4s of samples under contact
-          if (rawSamples.length > fs * 6 && goodContact && elapsed > 3.5) {
-            const windowSec = Math.min(14, Math.max(8, elapsed - 1));
-            const nWin = Math.min(rawSamples.length, Math.round(fs * windowSec));
-            const sliceTs = timestamps.slice(-nWin);
-            const sliceRaw = rawSamples.slice(-nWin);
-            const fsWin = robustSampleRate(sliceTs, 'ms') || fs;
-            const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.7);
-            let processed = filtfiltBandpass(sliceRaw, band.low, band.high, fsWin);
-            processed = savitzkyGolay(processed, Math.min(9, Math.max(5, Math.round(fsWin / 8) | 1)));
-            processed = normalize(linearDetrend(processed));
-
-            const est = estimateHeartRateSliding(
-              processed,
-              {
-                fs: fsWin,
-                fMin: band.low,
-                fMax: band.high,
-                lockedBpm,
-                useWelch: true,
-              },
-              Math.min(10, windowSec * 0.7),
-              2,
-            );
-
-            // Gate: do not publish low-SNR / discordant estimates
-            if (est.bpm != null && est.confidence >= 0.32 && !est.discordant) {
-              const stable = tracker.push(est.bpm, 0.32, est.confidence);
-              bpmLive = stable ?? est.bpm;
-              quality = est.quality;
-              if (est.confidence >= 0.55) {
-                lockedBpm = bpmLive;
-                settled = true;
-                status = 'Good signal';
-                cueLevel = 'good';
-              }
-            } else if (est.bpm != null && est.confidence >= 0.24) {
-              quality = est.quality * 0.65;
-              // Prefer no live reading over wrong reading when discordant
-              bpmLive = null; // withhold weak / discordant live BPM
-              status = est.discordant ? 'Stabilizing… hold still' : 'Hold still';
-              cueLevel = 'warn';
-            } else {
-              quality = est.quality * 0.45;
-            }
-          } else if (!goodContact) {
-            quality = 0.12;
-          }
-
-          lastFrameTs = now;
-          onLive({
-            waveform: [...waveformWindow],
-            quality,
-            bpmLive,
-            elapsedSec: elapsed,
-            status,
-            camera: {
-              mode: 'fingertip',
-              stream: stream!,
-              mirror: false,
-              cueLevel,
-              meanRed: meanR,
-              redDominance,
-              needsAlternateLight,
-            },
-          });
         }
 
-        raf = requestAnimationFrame(tick);
+        const pulR = pulsatility(recentR);
+        const pulG = pulsatility(recentG);
+        // Green often has the highest camera PPG SNR; red wins in transillumination.
+        const useGreen = pulG > pulR * 1.12 && pulG > 0.004;
+        const sample = useGreen ? meanG : meanR;
+
+        const filtered = filter.process(sample);
+        waveformWindow.push(filtered);
+        if (waveformWindow.length > 120) waveformWindow.shift();
+
+        let quality = 0.12;
+        let bpmLive: number | null = null;
+        let cueLevel: CameraCueLevel = 'bad';
+        let status = 'Cover the lens completely';
+
+        if (tooDark) {
+          status = 'Too dark — try flashlight or another phone light';
+          cueLevel = 'bad';
+          goodContactFrames = 0;
+          darkFrames++;
+          brightOkFrames = 0;
+        } else if (!coverageOk) {
+          darkFrames = Math.max(0, darkFrames - 2);
+          if (meanR < 70 || redDominance < 1.0) {
+            status = 'Cover the lens completely';
+          } else if (!redOk) {
+            status = 'Press gently — need more red glow';
+          } else {
+            status = 'Adjust pressure — brightness out of range';
+          }
+          cueLevel = 'bad';
+          goodContactFrames = 0;
+          brightOkFrames = 0;
+        } else if (!motionOk) {
+          darkFrames = 0;
+          status = 'Hold still';
+          cueLevel = 'warn';
+          goodContactFrames = Math.max(0, goodContactFrames - 1);
+          brightOkFrames++;
+        } else {
+          darkFrames = 0;
+          goodContactFrames++;
+          brightOkFrames++;
+          status = 'Hold still';
+          cueLevel = 'warn';
+        }
+
+        const goodContact = coverageOk && motionOk && goodContactFrames > 10;
+        contact.push(goodContact);
+        const needsAlternateLight = darkFrames > 45 && brightOkFrames < 10;
+        const fs = filterFs;
+
+        if (rawR.length > fs * 6 && goodContact && elapsed > 3.5) {
+          const windowSec = Math.min(14, Math.max(8, elapsed - 1));
+          const nWin = Math.min(rawR.length, Math.round(fs * windowSec));
+          const sliceTs = timestamps.slice(-nWin);
+          const sliceR = rawR.slice(-nWin);
+          const sliceG = rawG.slice(-nWin);
+          const sliceContact = contact.slice(-nWin);
+          const goodFrac = sliceContact.filter(Boolean).length / sliceContact.length;
+          const src = useGreen ? sliceG : sliceR;
+          const { signal: grid, fs: fsWin } = resampleUniform(src, sliceTs, 'ms');
+          const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.8);
+          let processed = medianFilter3(grid);
+          processed = filtfiltBandpass(processed, band.low, band.high, fsWin);
+          processed = savitzkyGolay(processed, Math.min(9, Math.max(5, Math.round(fsWin / 8) | 1)));
+          processed = normalize(linearDetrend(processed));
+
+          const est = estimateHeartRateSliding(
+            processed,
+            {
+              fs: fsWin,
+              fMin: band.low,
+              fMax: band.high,
+              lockedBpm,
+              useWelch: true,
+            },
+            Math.min(10, windowSec * 0.7),
+            2,
+          );
+
+          if (est.bpm != null && est.confidence >= 0.32 && !est.discordant && goodFrac >= 0.55) {
+            const stable = tracker.push(est.bpm, 0.32, est.confidence);
+            bpmLive = stable ?? est.bpm;
+            quality = est.quality;
+            if (est.confidence >= 0.55) {
+              lockedBpm = bpmLive;
+              settled = true;
+              status = 'Good signal';
+              cueLevel = 'good';
+            }
+          } else if (est.bpm != null && est.confidence >= 0.24) {
+            quality = est.quality * 0.65;
+            bpmLive = null;
+            status = est.discordant ? 'Stabilizing… hold still' : 'Hold still';
+            cueLevel = 'warn';
+          } else {
+            quality = est.quality * 0.45;
+          }
+        } else if (!goodContact) {
+          quality = 0.12;
+        }
+
+        onLive({
+          waveform: [...waveformWindow],
+          quality,
+          bpmLive,
+          elapsedSec: elapsed,
+          status,
+          camera: {
+            mode: 'fingertip',
+            stream: stream!,
+            mirror: false,
+            cueLevel,
+            meanRed: meanR,
+            redDominance,
+            needsAlternateLight,
+          },
+        });
       };
-      raf = requestAnimationFrame(tick);
+
+      const onRvfc = (now: number, meta: VideoFrameCallbackMeta) => {
+        if (done) return;
+        const mediaTime = meta.mediaTime;
+        if (mediaTime !== lastMediaTime) {
+          lastMediaTime = mediaTime;
+          processFrame(now);
+        }
+        if (!done && v.requestVideoFrameCallback) {
+          rvfcHandle = v.requestVideoFrameCallback(onRvfc);
+        }
+      };
+
+      const onRaf = () => {
+        if (done) return;
+        const now = performance.now();
+        const ct = video!.currentTime;
+        if (ct !== lastCurrentTime) {
+          lastCurrentTime = ct;
+          processFrame(now);
+        }
+        if (!done) raf = requestAnimationFrame(onRaf);
+      };
+
+      if (v.requestVideoFrameCallback) {
+        rvfcHandle = v.requestVideoFrameCallback(onRvfc);
+      } else {
+        raf = requestAnimationFrame(onRaf);
+      }
     });
   } finally {
+    done = true;
     cancelAnimationFrame(raf);
+    const v = video as VideoWithFrameCallback | null;
+    if (v?.cancelVideoFrameCallback && rvfcHandle) {
+      try {
+        v.cancelVideoFrameCallback(rvfcHandle);
+      } catch {
+        /* ignore */
+      }
+    }
     stream?.getTracks().forEach((t) => t.stop());
     if (video) {
       video.srcObject = null;
@@ -274,30 +364,73 @@ export async function runFingertipPpg(
   }
 
   const durationSec = (performance.now() - started) / 1000;
-  const fsFinal = robustSampleRate(timestamps, 'ms') || filterFs;
+  return finalizePpg(rawR, rawG, timestamps, contact, lockedBpm, settled, durationSec);
+}
 
-  // Discard settle / contact-establishment seconds for cleaner HR
-  const dropSec = 3.0;
-  const drop = Math.min(rawSamples.length, Math.round(fsFinal * dropSec));
-  const usableRaw = rawSamples.slice(drop);
-  const usableTs = timestamps.slice(drop);
-  const fs = robustSampleRate(usableTs, 'ms') || fsFinal;
+function pickChannel(r: number[], g: number[]): number[] {
+  if (r.length < 16) return r;
+  return pulsatility(g) > pulsatility(r) * 1.12 ? g : r;
+}
 
-  if (usableRaw.length < fs * 4) {
-    return {
-      methodId: 'fingertip_ppg',
-      bpm: null,
-      quality: 0.05,
-      confidence: 0,
-      durationSec,
-      notes: 'Insufficient samples — check contact and flashlight',
-      timestamp: Date.now(),
-    };
+function finalizePpg(
+  rawR: number[],
+  rawG: number[],
+  timestamps: number[],
+  contact: boolean[],
+  lockedBpm: number | null,
+  settled: boolean,
+  durationSec: number,
+): MethodResult {
+  const empty = (notes: string): MethodResult => ({
+    methodId: 'fingertip_ppg',
+    bpm: null,
+    quality: 0.05,
+    confidence: 0,
+    durationSec,
+    notes,
+    timestamp: Date.now(),
+  });
+
+  if (rawR.length < 30) {
+    return empty('Insufficient samples — check contact and flashlight');
   }
 
-  const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.7);
-  let processed = filtfiltBandpass(usableRaw, band.low, band.high, fs);
-  processed = savitzkyGolay(processed, Math.min(9, Math.max(5, (Math.round(fs / 8) | 1))));
+  const src = pickChannel(rawR, rawG);
+  const fsRaw = robustSampleRate(timestamps, 'ms') || FS_SEED;
+
+  // Prefer the longest good-contact run (skip placement / lift-off).
+  const minGood = Math.round(fsRaw * 8);
+  const runs = contiguousRuns(contact, minGood);
+  let useStart = 0;
+  let useEnd = src.length;
+  if (runs.length > 0) {
+    let best = runs[0];
+    for (const run of runs) {
+      if (run.end - run.start > best.end - best.start) best = run;
+    }
+    useStart = best.start;
+    useEnd = best.end;
+  } else {
+    // Fall back: drop settle seconds.
+    const drop = Math.min(src.length, Math.round(fsRaw * 3));
+    useStart = drop;
+  }
+
+  const sliceV = src.slice(useStart, useEnd);
+  const sliceT = timestamps.slice(useStart, useEnd);
+  if (sliceV.length < fsRaw * 4) {
+    return empty('Insufficient samples — check contact and flashlight');
+  }
+
+  const { signal: grid, fs } = resampleUniform(sliceV, sliceT, 'ms');
+  if (grid.length < fs * 4) {
+    return empty('Insufficient samples — check contact and flashlight');
+  }
+
+  const band = adaptiveBandHz(lockedBpm, 0.67, 3.5, 0.8);
+  let processed = medianFilter3(grid);
+  processed = filtfiltBandpass(processed, band.low, band.high, fs);
+  processed = savitzkyGolay(processed, Math.min(9, Math.max(5, Math.round(fs / 8) | 1)));
   processed = normalize(linearDetrend(processed));
 
   const est = estimateHeartRateSliding(
@@ -313,17 +446,25 @@ export async function runFingertipPpg(
     2,
   );
 
-  // Strong final gate: reject low confidence rather than publish wrong HR
   let bpm = est.bpm;
   let confidence = est.confidence * (settled ? 1 : 0.8);
   let quality = est.quality;
   let notes: string | undefined;
 
+  const usedFrac = (useEnd - useStart) / src.length;
+  if (usedFrac < 0.45) {
+    confidence *= 0.85;
+    notes = 'Used the longest steady-contact stretch';
+  }
   if (est.discordant) {
     confidence *= 0.6;
     notes = 'Autocorr/spectral disagreement — reduced confidence';
   }
-  if (confidence < 0.26 || (est.snrDb < 4.5 && est.peakCount < 5) || est.discordant && confidence < 0.4) {
+  if (
+    confidence < 0.26 ||
+    (est.snrDb < 4.5 && est.peakCount < 5) ||
+    (est.discordant && confidence < 0.4)
+  ) {
     notes = (notes ? notes + '; ' : '') + 'Signal too weak for reliable reading';
     bpm = null;
     confidence = 0;
@@ -331,8 +472,6 @@ export async function runFingertipPpg(
   if (!settled && bpm != null) {
     notes = notes ?? 'Signal coverage may have been weak';
   }
-
-  void lastFrameTs;
 
   return {
     methodId: 'fingertip_ppg',

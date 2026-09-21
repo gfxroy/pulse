@@ -26,7 +26,6 @@ export function Results({ latest, history, onBack, onHistoryChange }: Props) {
 
       {latest && (
         <section className="card card--highlight">
-          <p className="cta-kicker">Latest</p>
           <h2>Your reading</h2>
           <BpmDisplay
             bpm={latest.bpm}

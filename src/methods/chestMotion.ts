@@ -10,7 +10,7 @@ import { estimateHeartRateSliding, HrTracker } from '../dsp/hrEstimate';
 import { autocorrHeartRate } from '../dsp/autocorr';
 import { combineQuality, timeDomainSnrDb, regularityScore, bpmAgreement } from '../dsp/quality';
 import { spectralPeakHarmonicAware } from '../dsp/welch';
-import { savitzkyGolay, linearDetrend } from '../dsp/preprocess';
+import { savitzkyGolay, linearDetrend, resampleSeries } from '../dsp/preprocess';
 import type { MethodResult } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
@@ -22,14 +22,16 @@ export async function runChestMotion(
   onLive: LiveCallback,
   signal: AbortSignal,
 ): Promise<MethodResult> {
-  const started = Date.now();
+  const started = performance.now();
   const accelZ: { t: number; v: number }[] = [];
   const gyroMag: { t: number; v: number }[] = [];
   const tracker = new HrTracker(6);
 
   const onMotion = (e: DeviceMotionEvent) => {
-    const t = (Date.now() - started) / 1000;
-    const az = e.accelerationIncludingGravity?.z ?? e.acceleration?.z;
+    const t = (performance.now() - started) / 1000;
+    // Prefer linear acceleration (gravity removed). Gravity-included Z is a
+    // ~9.8 DC with a tiny BCG — usable after bandpass, but noisier.
+    const az = e.acceleration?.z ?? e.accelerationIncludingGravity?.z;
     if (az != null) accelZ.push({ t, v: az });
     const gx = e.rotationRate?.alpha ?? 0;
     const gy = e.rotationRate?.beta ?? 0;
@@ -51,7 +53,7 @@ export async function runChestMotion(
           reject(new DOMException('Aborted', 'AbortError'));
           return;
         }
-        const elapsed = (Date.now() - started) / 1000;
+        const elapsed = (performance.now() - started) / 1000;
         if (elapsed >= DURATION) {
           resolve();
           return;
@@ -98,7 +100,7 @@ export async function runChestMotion(
     window.removeEventListener('devicemotion', onMotion);
   }
 
-  const durationSec = (Date.now() - started) / 1000;
+  const durationSec = (performance.now() - started) / 1000;
   const result = processMotionBuffers(accelZ, gyroMag, lockedBpm);
 
   return {
@@ -114,25 +116,6 @@ export async function runChestMotion(
   };
 }
 
-function resample(series: { t: number; v: number }[], fs: number): Float32Array {
-  if (series.length < 2) return new Float32Array(0);
-  const t0 = series[0].t;
-  const t1 = series[series.length - 1].t;
-  const n = Math.max(1, Math.floor((t1 - t0) * fs));
-  const out = new Float32Array(n);
-  let j = 0;
-  for (let i = 0; i < n; i++) {
-    const t = t0 + i / fs;
-    while (j < series.length - 2 && series[j + 1].t < t) j++;
-    const a = series[j];
-    const b = series[Math.min(j + 1, series.length - 1)];
-    const span = b.t - a.t || 1e-6;
-    const u = (t - a.t) / span;
-    out[i] = a.v + (b.v - a.v) * Math.max(0, Math.min(1, u));
-  }
-  return out;
-}
-
 function processMotionBuffers(
   accelZ: { t: number; v: number }[],
   gyroMag: { t: number; v: number }[],
@@ -145,8 +128,8 @@ function processMotionBuffers(
   snrDb: number;
   notes?: string;
 } {
-  let az = resample(accelZ, FS);
-  let gz = resample(gyroMag, FS);
+  let az = resampleSeries(accelZ, FS);
+  let gz = resampleSeries(gyroMag, FS);
   // Discard settle / placement seconds
   const settle = Math.round(FS * 2.5);
   if (az.length > settle) az = az.subarray(settle);

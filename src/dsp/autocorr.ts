@@ -171,8 +171,9 @@ function pickAutocorrFundamental(
       }
     }
 
-    // Slight preference for physiologically common resting band when close
-    if (c.bpm >= 55 && c.bpm <= 100) score *= 1.05;
+    // Tiny resting-band nudge only when correlations are within 8% — never
+    // strong enough to beat a clearly better peak 20 BPM away.
+    if (c.bpm >= 55 && c.bpm <= 105) score *= 1.02;
 
     if (score > bestScore) {
       bestScore = score;

@@ -10,7 +10,7 @@ import { estimateHeartRateSliding, HrTracker } from '../dsp/hrEstimate';
 import { autocorrHeartRate } from '../dsp/autocorr';
 import { combineQuality, timeDomainSnrDb, regularityScore, bpmAgreement } from '../dsp/quality';
 import { spectralPeakHarmonicAware } from '../dsp/welch';
-import { savitzkyGolay, linearDetrend } from '../dsp/preprocess';
+import { savitzkyGolay, linearDetrend, resampleSeries } from '../dsp/preprocess';
 import type { MethodResult } from '../types';
 import type { LiveCallback } from './types';
 import { METHOD_META } from './meta';
@@ -22,15 +22,17 @@ export async function runHandheldAccel(
   onLive: LiveCallback,
   signal: AbortSignal,
 ): Promise<MethodResult> {
-  const started = Date.now();
+  const started = performance.now();
   const samples: { t: number; v: number }[] = [];
   const tracker = new HrTracker(8);
 
   const onMotion = (e: DeviceMotionEvent) => {
-    const t = (Date.now() - started) / 1000;
-    const ax = e.accelerationIncludingGravity?.x ?? 0;
-    const ay = e.accelerationIncludingGravity?.y ?? 0;
-    const az = e.accelerationIncludingGravity?.z ?? 0;
+    const t = (performance.now() - started) / 1000;
+    const lin = e.acceleration;
+    const grav = e.accelerationIncludingGravity;
+    const ax = lin?.x ?? grav?.x ?? 0;
+    const ay = lin?.y ?? grav?.y ?? 0;
+    const az = lin?.z ?? grav?.z ?? 0;
     const mag = Math.sqrt(ax * ax + ay * ay + az * az);
     samples.push({ t, v: mag });
   };
@@ -47,7 +49,7 @@ export async function runHandheldAccel(
           reject(new DOMException('Aborted', 'AbortError'));
           return;
         }
-        const elapsed = (Date.now() - started) / 1000;
+        const elapsed = (performance.now() - started) / 1000;
         if (elapsed >= DURATION) {
           resolve();
           return;
@@ -93,7 +95,7 @@ export async function runHandheldAccel(
     window.removeEventListener('devicemotion', onMotion);
   }
 
-  const durationSec = (Date.now() - started) / 1000;
+  const durationSec = (performance.now() - started) / 1000;
   const result = analyze(samples, lockedBpm);
 
   // Stronger final gate — prefer null over wrong
@@ -121,25 +123,6 @@ export async function runHandheldAccel(
   };
 }
 
-function resample(series: { t: number; v: number }[], fs: number): Float32Array {
-  if (series.length < 2) return new Float32Array(0);
-  const t0 = series[0].t;
-  const t1 = series[series.length - 1].t;
-  const n = Math.max(1, Math.floor((t1 - t0) * fs));
-  const out = new Float32Array(n);
-  let j = 0;
-  for (let i = 0; i < n; i++) {
-    const t = t0 + i / fs;
-    while (j < series.length - 2 && series[j + 1].t < t) j++;
-    const a = series[j];
-    const b = series[Math.min(j + 1, series.length - 1)];
-    const span = b.t - a.t || 1e-6;
-    const u = (t - a.t) / span;
-    out[i] = a.v + (b.v - a.v) * Math.max(0, Math.min(1, u));
-  }
-  return out;
-}
-
 function analyze(
   samples: { t: number; v: number }[],
   lockedBpm: number | null,
@@ -150,7 +133,7 @@ function analyze(
   peakCount: number;
   snrDb: number;
 } {
-  let x = resample(samples, FS);
+  let x = resampleSeries(samples, FS);
   const settle = Math.round(FS * 3);
   if (x.length > settle) x = x.subarray(settle);
   if (x.length < FS * 10) {

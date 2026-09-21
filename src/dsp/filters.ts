@@ -164,9 +164,11 @@ export function adaptiveBandHz(
     return { low: defaultLow, high: defaultHigh };
   }
   const f0 = lockedBpm / 60;
+  // Keep the lock from clipping a true HR ~15–20 BPM away (a prior failure mode).
+  const width = Math.max(halfWidthHz, 0.75);
   return {
-    low: Math.max(defaultLow, f0 - halfWidthHz),
-    high: Math.min(defaultHigh, f0 + halfWidthHz),
+    low: Math.max(defaultLow, f0 - width),
+    high: Math.min(defaultHigh, f0 + width),
   };
 }
 

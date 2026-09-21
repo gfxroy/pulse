@@ -9,7 +9,6 @@ interface Props {
 export function BpmDisplay({ bpm, confidence, subtitle }: Props) {
   return (
     <div className="bpm-display">
-      <div className="bpm-display__eyebrow">Pulse reading</div>
       <div className="bpm-display__value" aria-live="polite">
         {bpm != null ? Math.round(bpm) : '—'}
         <span className="bpm-display__unit">BPM</span>

@@ -137,3 +137,103 @@ export function trimmedMean(values: number[], trimFrac = 0.2): number | null {
   if (slice.length === 0) return s[Math.floor(s.length / 2)];
   return slice.reduce((a, b) => a + b, 0) / slice.length;
 }
+
+/** 3-point median — kills single-frame AE / salt-pepper spikes. */
+export function medianFilter3(signal: Float32Array | number[]): Float32Array {
+  const n = signal.length;
+  const out = new Float32Array(n);
+  if (n === 0) return out;
+  out[0] = signal[0];
+  if (n === 1) return out;
+  out[n - 1] = signal[n - 1];
+  for (let i = 1; i < n - 1; i++) {
+    const a = signal[i - 1];
+    const b = signal[i];
+    const c = signal[i + 1];
+    out[i] = a > b ? (b > c ? b : a > c ? c : a) : b > c ? (a > c ? a : c) : b;
+  }
+  return out;
+}
+
+/**
+ * Linear-interpolate irregular timestamped samples onto a uniform grid.
+ * Camera/IMU timestamps are never perfectly regular; treating them as uniform
+ * smears the spectral peak and can bias BPM low.
+ */
+export function resampleUniform(
+  values: ArrayLike<number>,
+  timestamps: ArrayLike<number>,
+  unit: 'ms' | 's' = 'ms',
+  targetFs?: number,
+): { signal: Float32Array; fs: number } {
+  const n = values.length;
+  if (n === 0) return { signal: new Float32Array(0), fs: targetFs ?? 0 };
+  if (n === 1) {
+    const out = new Float32Array(1);
+    out[0] = values[0];
+    return { signal: out, fs: targetFs ?? 0 };
+  }
+
+  const t = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    t[i] = unit === 'ms' ? timestamps[i] / 1000 : timestamps[i];
+  }
+  const t0 = t[0];
+  const t1 = t[n - 1];
+  const span = t1 - t0;
+  if (span <= 0) {
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) out[i] = values[i];
+    return { signal: out, fs: targetFs ?? 0 };
+  }
+
+  const measured = targetFs && targetFs > 0 ? targetFs : robustSampleRate(timestamps, unit);
+  const fs = Math.max(8, Math.min(120, measured || 30));
+  const nOut = Math.max(2, Math.floor(span * fs) + 1);
+  const out = new Float32Array(nOut);
+  let j = 0;
+  for (let i = 0; i < nOut; i++) {
+    const ti = t0 + i / fs;
+    while (j < n - 2 && t[j + 1] < ti) j++;
+    const tA = t[j];
+    const tB = t[Math.min(j + 1, n - 1)];
+    const spanAB = tB - tA || 1e-9;
+    const u = Math.max(0, Math.min(1, (ti - tA) / spanAB));
+    const vA = values[j];
+    const vB = values[Math.min(j + 1, n - 1)];
+    out[i] = vA + (vB - vA) * u;
+  }
+  return { signal: out, fs };
+}
+
+/** Resample a {t, v} series (t in seconds) onto a uniform grid at fs. */
+export function resampleSeries(series: { t: number; v: number }[], fs: number): Float32Array {
+  if (series.length < 2 || fs <= 0) return new Float32Array(0);
+  const values = new Float32Array(series.length);
+  const ts = new Float64Array(series.length);
+  for (let i = 0; i < series.length; i++) {
+    values[i] = series[i].v;
+    ts[i] = series[i].t;
+  }
+  return resampleUniform(values, ts, 's', fs).signal;
+}
+
+/**
+ * Longest contiguous runs of `true` in a parallel flag array.
+ * Used to estimate HR only on good fingertip contact, not placement noise.
+ */
+export function contiguousRuns(
+  flags: ArrayLike<boolean>,
+  minLength = 1,
+): { start: number; end: number }[] {
+  const runs: { start: number; end: number }[] = [];
+  let i = 0;
+  const n = flags.length;
+  while (i < n) {
+    while (i < n && !flags[i]) i++;
+    const start = i;
+    while (i < n && flags[i]) i++;
+    if (i - start >= minLength) runs.push({ start, end: i });
+  }
+  return runs;
+}

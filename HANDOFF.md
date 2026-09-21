@@ -69,7 +69,7 @@ Live site: https://gfxroy.github.io/pulse/
 |------|------|
 | App shell / routing | `src/App.tsx` |
 | Screens | `src/screens/` — Onboarding, Home, Measure, Composite, Results |
-| Visual setup guides (SVG) | `src/guides/GuideArt.tsx`, `src/components/VisualGuide.tsx` |
+| Visual setup guides (drawings) | `public/guides/`, `src/guides/GuideArt.tsx`, `src/components/VisualGuide.tsx` |
 | Live camera overlays | `src/components/CameraGuide.tsx` |
 | DSP | `src/dsp/` — filters, autocorr, Welch, peaks, hrEstimate, quality |
 | Methods | `src/methods/` — fingertipPpg, facialRppg, chestMotion, handheldAccel, micPcg |
